@@ -719,7 +719,7 @@ LB = - grid['w_exp'] + 1
 
 from torch_layers import *
 
-patience = 50
+patience = 100
 batch_size = 2000
 num_epoch = 1000
 
@@ -728,7 +728,7 @@ tensor_trainY = torch.FloatTensor(train_errors)
 train_data_loader = create_data_loader([tensor_trainY], batch_size = batch_size)
 valid_data_loader = create_data_loader([tensor_trainY], batch_size = batch_size)
 
-robust_opf_model = Robust_OPF(grid['n_wind'], 6, grid, UB, LB, c_viol = 1000)
+robust_opf_model = Robust_OPF(grid['n_wind'], 4, grid, UB, LB, c_viol = 100)
 optimizer = torch.optim.Adam(robust_opf_model.parameters(), lr = 1e-2)
 robust_opf_model.train_model(train_data_loader, valid_data_loader, optimizer, epochs = num_epoch, patience = patience, validation = False)
 

@@ -89,8 +89,8 @@ class Robust_OPF(nn.Module):
         h_init = np.row_stack((-LB, UB)).reshape(-1)
         
         for i in range(num_constr - len(h_init)):
-            h_init = np.row_stack((h_init.reshape(-1,1), np.zeros((1,1)))).reshape(-1)
-            H_init = np.row_stack((H_init, np.zeros((1, num_uncertainties)))) 
+            h_init = np.row_stack((h_init.reshape(-1,1), np.zeros((1,1)) ) ).reshape(-1)
+            H_init = np.row_stack((H_init, np.random.randn(1, num_uncertainties)) ) 
 
         #H_init = np.zeros((num_constr, num_uncertainties))
         #h_init = np.zeros(num_constr)
@@ -291,7 +291,7 @@ class Robust_OPF(nn.Module):
                 
                 running_loss += loss.item()
                 
-            if epoch%5 == 0:
+            if epoch%10 == 0:
                 
                 fig, ax = plt.subplots(figsize = (6,4))
                 x = np.linspace(-3, 3, 1000)

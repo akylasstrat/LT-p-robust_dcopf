@@ -586,7 +586,7 @@ box = Polygon(np.array(box_vert), fill = False,
                   edgecolor = 'black', linewidth = 3, label = '$\mathcal{U}$')
 patches.append(box)
 ax.add_patch(box)
-
+plt.ylim([-2, 2])
 plt.show()
 
 # solve robust OPF
@@ -684,6 +684,7 @@ x,y = np.meshgrid(d,d)
 plt.imshow( ( (H_poly[0,0]*x + H_poly[0,1]*y <= h_poly[0]) & (H_poly[1,0]*x + H_poly[1,1]*y <= h_poly[1]) &
              (H_poly[2,0]*x + H_poly[2,1]*y <= h_poly[2]) & (H_poly[3,0]*x + H_poly[3,1]*y <= h_poly[3]) ).astype(int) , 
                 extent=(x.min(),x.max(),y.min(),y.max()), origin="lower", cmap="Greys", alpha = 0.3)
+plt.ylim([-2, 2])
 plt.show()
 
 #%% Out-of-sample test
@@ -692,6 +693,7 @@ N_test = 2000
 distr = 'normal'
 
 test_errors = create_wind_errors(N_test, grid['w_cap'], grid['w_exp'], std = 0.25, seed = 1)
+
 
 
 #%%
@@ -710,3 +712,30 @@ fig, ax = plt.subplots()
 output.T.plot(kind = 'bar', ax = ax)
 plt.show()
 
+#%% Cost-based learning of a polytope
+
+UB = grid['w_cap'] - grid['w_exp'] - 1
+LB = - grid['w_exp'] + 1
+
+from torch_layers import *
+
+patience = 50
+batch_size = 2000
+num_epoch = 1000
+
+tensor_trainY = torch.FloatTensor(train_errors)
+
+train_data_loader = create_data_loader([tensor_trainY], batch_size = batch_size)
+valid_data_loader = create_data_loader([tensor_trainY], batch_size = batch_size)
+
+robust_opf_model = Robust_OPF(grid['n_wind'], 6, grid, UB, LB, c_viol = 1000)
+optimizer = torch.optim.Adam(robust_opf_model.parameters(), lr = 1e-2)
+robust_opf_model.train_model(train_data_loader, valid_data_loader, optimizer, epochs = num_epoch, patience = patience, validation = False)
+
+#%%
+H_tensor = nn.Parameter(torch.FloatTensor(H_bound).requires_grad_())
+h_tensor = nn.Parameter(torch.FloatTensor(h_bound).requires_grad_())
+# forward pass just for a check
+results = robust_opf_model.forward(H_tensor, h_tensor)
+
+#%%

@@ -14,7 +14,7 @@ import cvxpy as cp
 from cvxpylayers.torch import CvxpyLayer
 import torch
 import gurobipy as gp
-
+import itertools
 #import pickle
 
 from sklearn.model_selection import train_test_split
@@ -35,163 +35,36 @@ plt.rcParams['font.serif'] = 'Times New Roman'
 plt.rcParams["mathtext.fontset"] = 'dejavuserif'
 
 
-def box_robust_dcopf_problem_param(mu_init, sigma_init, demand, wind, allow_slack=False, quadratic_cost=False, gamma=0):
+def oos_cost_estimation(realizations, sol_dict, grid, c_viol = 2*1e3):
+    
+    recourse_actions = -(sol_dict['A']@realizations.T).T
+    
 
-    # some settings
-    A_base = 10
-    slack_base = 10
-    obj_base = basemva/10
+    # exceeding reserves
+    aggr_rup_violations = np.maximum( recourse_actions - sol_dict['r_up'], 0).sum()
+    aggr_rdown_violations = np.maximum( -recourse_actions - sol_dict['r_down'], 0).sum()
+                             
+                                                                                 
+    # exceeding line rating
+    rt_injections = (grid['PTDF']@(grid['node_G']@recourse_actions.T + grid['node_W']@realizations.T)).T
     
-    FR = 0.8 # reduction of line capacity
+    aggr_f_margin_up_violations = np.maximum( rt_injections - sol_dict['f_margin_up'], 0).sum()
+    aggr_f_margin_down_violations = np.maximum( -rt_injections - sol_dict['f_margin_down'], 0).sum()
     
-    # define mean and uncertainty of wind power injections as parameters
-    mu = cp.Parameter(D, value=mu_init, name="mu")
-    sigma = cp.Parameter(D, value=sigma_init, name="sigma")
-    
-     # define load as a parameter
-    d = cp.Parameter(B, value=demand, nonneg=True, name="demand")
-    w = cp.Parameter(D, value=wind, nonneg=True, name="wind")
-        
-    # main variables
-    p  = cp.Variable(G, nonneg=True, name="p")
-    rp = cp.Variable(G, nonneg=True, name="rp") # reserve up
-    rm = cp.Variable(G, nonneg=True, name="rm") # reserve down
-    A  = cp.Variable((G,D), nonneg=True, name="A") # Linear decision rules, maps error realizations to generator setpoints
-    fRAMp = cp.Variable(L, nonneg=True, name="fRAMp")
-    fRAMm = cp.Variable(L, nonneg=True, name="fRAMm")
+    print('Times of violations')    
+    print('Upward reserve margin:', ((recourse_actions - sol_dict['r_up'])>0).sum() )
+    print('Downward reserve margin:', ((recourse_actions - sol_dict['r_down'])>0).sum() )
+    print('Upward line capacity margin:', ((rt_injections - sol_dict['f_margin_up'])>0).sum() )
+    print('Downward line capacity margin:', ((-rt_injections - sol_dict['f_margin_down'])>0).sum() )
 
-    # aux. variables for robust constraints
-    z = cp.Variable((2*G + 2*L,D), name="z")
+    print('Max exceedence')    
+    print('Upward reserve margin:',  np.maximum( recourse_actions - sol_dict['r_up'], 0).max() )
+    print('Downward reserve margin:', np.maximum( -recourse_actions - sol_dict['r_down'], 0).max() )
+    print('Upward line capacity margin:', np.maximum( rt_injections - sol_dict['f_margin_up'], 0).max() )
+    print('Downward line capacity margin:', np.maximum( -rt_injections - sol_dict['f_margin_down'], 0).max() )
     
-    # aux. variables to ensure feasibility
-    if allow_slack:
-        slack = cp.Variable(2*G + 2*L, nonneg=True, name="slack")
-    
-    # basic det constraints
-    flow = ptdf @ ((gen2bus @ p) + (wind2bus @ w) - d)
-    consts = [
-        cp.sum(p) + cp.sum(w) == cp.sum(d),
-        p + rp <= pmax,
-        p - rm >= pmin, 
-        A.T @ np.ones(G) == np.ones(D)*A_base,
-         flow + fRAMp == smax * FR,
-        -flow + fRAMm == smax * FR
-    ]
-
-    # upper/lower bound with l-inf norm and primitive uncertainty
-    #m.addConstr(aux_g_up[g] >= -P@coef[g])
-    #m.addConstr(aux_g_up[g] >= P@coef[g])
-    #m.addConstr(aux_g_down[g] >= -P@coef[g])
-    #m.addConstr(aux_g_down[g] >= P@coef[g])
-
-    #m.addConstr( coef[g]@u_nom + aux_g_up[g]@np.ones(n_feat) <= Pmax[g] )
-    #m.addConstr( coef[g]@(-u_nom) + aux_g_down[g]@np.ones(n_feat) <= 0 )
-
-    # box support constraints
-    for g in range(G):
-        if allow_slack:
-            consts.append((mu.T @ (-A[g,:]/A_base)) + (sigma.T @ A[g,:]/A_base) <= rp[g] + slack[g]/slack_base)
-        else:
-            consts.append((mu.T @ (-A[g,:]/A_base)) + (sigma.T @ A[g,:]/A_base) <= rp[g])
-        if allow_slack:
-            consts.append((mu.T @ (A[g,:]/A_base)) + (sigma.T @  A[g,:]/A_base) <= rm[g] + slack[g+G]/slack_base)
-        else:
-            consts.append((mu.T @ (A[g,:]/A_base)) + (sigma.T @  A[g,:]/A_base) <= rm[g])
-    for l in range(L):
-        Bl = cp.reshape(ptdf[l,:] @ (wind2bus - (gen2bus @ A/A_base)), D)
-        # Bl = (ptdf[l,:] @ (wind2bus - (gen2bus @ A))).T
-        if allow_slack:
-            consts.append(mu.T @ Bl + (sigma.T @ z[l,:]) <= fRAMp[l] + slack[2*G+l]/slack_base)
-        else:
-            consts.append(mu.T @ Bl + (sigma.T @ z[l,:]) <= fRAMp[l])
-        consts.append(z[l,:] >= Bl)
-        consts.append(z[l,:] >= -Bl)
-        if allow_slack:
-            consts.append(mu.T @ -Bl + (sigma.T @ z[L+l,:]) <= fRAMm[l] + slack[2*G+L+l]/slack_base)   
-        else:
-            consts.append(mu.T @ -Bl + (sigma.T @ z[L+l,:]) <= fRAMm[l])
-        consts.append(z[L+l,:] >= -Bl)
-        consts.append(z[L+l,:] >= Bl)
-
-    # objective
-    cost_E = (cE.T @ p)
-    if quadratic_cost:
-        cost_E_quad = cp.sum_squares(cp.multiply(cE_quad, p))
-    else:
-        cost_E_quad = 0                         
-    cost_R = (cR.T @ (rp + rm))
-    objective = cost_E + cost_E_quad + cost_R
-    
-    if allow_slack:
-        thevars = [p, rp, rm, A, fRAMp, fRAMm, z, slack]
-    else:
-        thevars = [p, rp, rm, A, fRAMp, fRAMm, z]
-    x = cp.hstack([v.flatten() for v in thevars])
-    regularization = gamma * cp.sum_squares(x)
-    objective += regularization
-    
-    if allow_slack:
-        penalty_slack = cp.sum(slack) * obj_base * 1e3
-        objective += penalty_slack
-    
-    theprob = cp.Problem(cp.Minimize(objective), consts)
-    
-    return theprob, thevars, [d, w, mu, sigma], consts
-
-def create_historical_data(w_fcst, N=1000, SEED=42, metadata=False, corr=0.1, rel_sigma=[0.15, 0.15]):
-    mu = np.zeros(D)
-    rel_sigma = np.array(rel_sigma)
-    correlation = np.matrix([[1.0, corr],[corr, 1.0]])
-    sigma = w_fcst * rel_sigma
-    Sigma = np.diag(sigma)*correlation*np.diag(sigma)
-    # sample
-    # np.random.seed(seed=SEED)
-    hist_data = np.random.multivariate_normal(mu, Sigma, size=N)
-    # truncate
-    for j in range(D):
-        hist_data[(hist_data[:,j] >= w_cap[j] - w_fcst[j]),j] = w_cap[j] - w_fcst[j]
-        hist_data[(hist_data[:,j] <= -w_fcst[j]),j] = -w_fcst[j]
-    if metadata:
-        return hist_data, mu, Sigma
-    else:
-        return hist_data
-
-def expected_cost(var_values, hist_data_tch, gamma=0):
-    
-    # some settings
-    A_base = 10
-    slack_base = 10
-    obj_base = basemva/10
-    
-    p = var_values[0]
-    rp = var_values[1]
-    rm = var_values[2]
-    A = var_values[3]
-    fRAMp = var_values[4]
-    fRAMm = var_values[5]
-    if len(var_values) == 8:
-        slack = var_values[-1]
-    else:
-        slack = torch.tensor(0)
-    varlist = [p, rp, rm, A, fRAMp, fRAMm, slack]
-    x = torch.hstack([v.flatten() for v in varlist])
-        
-    # expected first stage cost
-    opf_cost = (torch.dot(p, cE_tch) + torch.dot(rp + rm, cR_tch)) 
-    opf_cost += torch.sum(slack) * obj_base * 1e3
-
-    # expected reserve violation cost
-    reaction_gen = torch.matmul(A/A_base, hist_data_tch.T)
-    expected_rp_viol_cost = torch.sum(nonneg(-reaction_gen.T - rp[None, :]).mean(axis=0) * cM_tch)
-    expected_rm_viol_cost = torch.sum(nonneg(reaction_gen.T - rm[None, :]).mean(axis=0) * cM_tch)
-    reaction_branch = torch.matmul(torch.matmul(ptdf_tch,(wind2bus_tch - torch.matmul(gen2bus_tch, A/A_base))), hist_data_tch.T)
-    expected_framp_viol_cost = torch.sum(nonneg(reaction_branch.T - fRAMp[None, :]).mean(axis=0) * cM_tch)
-    expected_framm_viol_cost = torch.sum(nonneg(-reaction_branch.T - fRAMm[None, :]).mean(axis=0) * cM_tch)
-    
-    regularization = gamma*torch.sum(torch.square(x))
-    
-    return opf_cost + expected_rp_viol_cost + expected_rm_viol_cost + expected_framp_viol_cost + expected_framm_viol_cost + regularization
-#%%
+    rt_cost = c_viol*(aggr_rup_violations + aggr_rdown_violations + aggr_f_margin_up_violations + aggr_f_margin_down_violations)
+    return(rt_cost)
 
 def dc_opf(grid, demands, network = True, plot = False, verbose = 0, return_ave_cpu = False):
     ''' Clears the forward (DA) market/ DC-OPF, returns the solutions in dictionary. 
@@ -300,7 +173,7 @@ def dc_opf(grid, demands, network = True, plot = False, verbose = 0, return_ave_
         return Det_solutions
 
 
-def robust_dcopf(H, h, w_expected, grid, policy='affine', network = True, slack_var = False, rho = 1, loss = 'cost', verbose = -1, horizon = 1):
+def robust_dcopf_polyhedral(H, h, w_expected, grid, policy='affine', network = True, slack_var = False, rho = 1, loss = 'cost', verbose = -1, horizon = 1):
     ''' 
     Solves robust DCOPF for polyhedral uncertainty set (covers box uncertainty set as a special case, but it's less efficient that the dual norm)
     Linear decision rules for a recourse policy of generator dispatch decisions    
@@ -346,7 +219,9 @@ def robust_dcopf(H, h, w_expected, grid, policy='affine', network = True, slack_
     slack_u = m.addMVar((grid['n_loads']), vtype = gp.GRB.CONTINUOUS, lb = 0, name = 'slack_up')
     slack_d = m.addMVar((grid['n_loads']), vtype = gp.GRB.CONTINUOUS, lb = 0, name = 'slack_down')
     
-    flow_da = m.addMVar((grid['n_lines']), vtype = gp.GRB.CONTINUOUS, lb = -gp.GRB.INFINITY)    
+    f_margin_up = m.addMVar((grid['n_lines']), vtype = gp.GRB.CONTINUOUS, lb = 0, name = 'upward reserve')
+    f_margin_down = m.addMVar((grid['n_lines']), vtype = gp.GRB.CONTINUOUS, lb = 0, name = 'downward reserve')    
+    #flow_da = m.addMVar((grid['n_lines']), vtype = gp.GRB.CONTINUOUS, lb = -gp.GRB.INFINITY)    
 
     
     ### DA constraints 
@@ -363,16 +238,19 @@ def robust_dcopf(H, h, w_expected, grid, policy='affine', network = True, slack_
     m.addConstr(PTDF@(node_G@p_G + node_W@w_expected - node_L@grid['Pd'] ) <= grid['Line_Capacity'].reshape(-1) )
     m.addConstr(PTDF@(node_G@p_G + node_W@w_expected - node_L@grid['Pd'] ) >= -grid['Line_Capacity'].reshape(-1) )
 
-    m.addConstr(flow_da == PTDF@(node_G@p_G + node_W@w_expected - node_L@grid['Pd'] ) )
-    m.addConstr(flow_da <= grid['Line_Capacity'].reshape(-1) )
-    m.addConstr(flow_da >= -grid['Line_Capacity'].reshape(-1) )
+    #m.addConstr(flow_da == PTDF@(node_G@p_G + node_W@w_expected - node_L@grid['Pd'] ) )
+    #m.addConstr(flow_da <= grid['Line_Capacity'].reshape(-1) )
+    #m.addConstr(flow_da >= -grid['Line_Capacity'].reshape(-1) )
+
+    m.addConstr(grid['Line_Capacity'].reshape(-1) - f_margin_up == PTDF@(node_G@p_G + node_W@w_expected - node_L@grid['Pd'] ) )
+    m.addConstr(grid['Line_Capacity'].reshape(-1) - f_margin_down == -PTDF@(node_G@p_G + node_W@w_expected - node_L@grid['Pd'] ) )
 
     # robust constraints for all xi in H@xi <= h
     # W@xi <= r_down_G
     # -W@xi <= r_up_G
     
     # Reformulation of robust constraints
-    # downward reserve bound
+    # downward reserve bound/ each row are the duals to reformulate each constraints
     lambda_up = m.addMVar((grid['n_unit'], num_constr) , vtype = gp.GRB.CONTINUOUS, lb = 0)
     lambda_down = m.addMVar((grid['n_unit'], num_constr) , vtype = gp.GRB.CONTINUOUS, lb = 0)
     
@@ -380,7 +258,7 @@ def robust_dcopf(H, h, w_expected, grid, policy='affine', network = True, slack_
     m.addConstr( h@lambda_down.T <= r_down_G)
 
     m.addConstr( lambda_up@H == -W )
-    m.addConstr( h@lambda_down.T <= r_down_G)
+    m.addConstr( h@lambda_up.T <= r_up_G)
             
     #node_inj = m.addMVar((grid['n_nodes'], n_samples), vtype = gp.GRB.CONTINUOUS, lb = -gp.GRB.INFINITY)        
     if network:
@@ -402,13 +280,159 @@ def robust_dcopf(H, h, w_expected, grid, policy='affine', network = True, slack_
         # PTDF@node_g@(W@xi) + PTDF@node_w@(xi)
         # reformulation of robust constraints for line flows
         m.addConstr( lambda_f_up@H == PTDF@(-node_G@W + node_W)  )
-        m.addConstr( h@lambda_f_up.T <= grid['Line_Capacity'] - flow_da )
+        m.addConstr( h@lambda_f_up.T <= f_margin_up )
 
         m.addConstr( lambda_f_down@H == -PTDF@(-node_G@W + node_W) )
-        m.addConstr( h@lambda_f_down.T <= grid['Line_Capacity'] + flow_da)
+        m.addConstr( h@lambda_f_down.T <= f_margin_down)
                                    
-        m.setObjective( Cost@p_G + C_r_up@r_up_G + C_r_down@r_down_G, gp.GRB.MINIMIZE)             
-        m.optimize()
+    m.setObjective( Cost@p_G + C_r_up@r_up_G + C_r_down@r_down_G, gp.GRB.MINIMIZE)             
+    m.optimize()
+    try:       
+        rob_sol = {}
+        rob_sol['da_cost'] = m.objVal
+        rob_sol['p_da'] = p_G.X
+        rob_sol['r_up'] = r_up_G.X
+        rob_sol['r_down'] = r_down_G.X
+        rob_sol['A'] = W.X
+        rob_sol['f_margin_up'] = f_margin_up.X
+        rob_sol['f_margin_down'] = f_margin_down.X
+        
+        return rob_sol
+
+    except:
+        print('Infeasible solution')
+        # scale cost back to aggregate    
+        return 1e10, [], []
+            
+
+def robust_dcopf_box(UB, LB, H, h, w_expected, grid, network = True, slack_var = False, verbose = -1, horizon = 1):
+    ''' 
+    Solves robust DCOPF for box uncertainty set, reformulates using the dual norm
+    Linear decision rules for a recourse policy of generator dispatch decisions    
+    Uncertainty set: l_inf: || xi ||_inf <= rho
+    '''
+        
+    # Grid Parameters
+    Pmax = grid['Pmax']
+    C_r_up = grid['C_r_up']
+    C_r_down = grid['C_r_down']
+    Cost = grid['Cost']    
+    
+    node_G = grid['node_G']
+    node_L = grid['node_L']
+    node_W = grid['node_W']
+        
+    PTDF = grid['PTDF']
+    VOLL = grid['VOLL']
+    VOWS = grid['VOWS']
+    
+    n_feat = grid['n_wind']
+    # number of robust constraints to be reformulated
+    
+    num_constr = len(h)
+    
+    m = gp.Model()
+    if verbose == -1:
+        m.setParam('OutputFlag', 0)
+    
+            
+    #formulation with primitive factors
+    u_nom = (UB+LB)/2
+    P = np.diag((UB-LB)/2)
+    rho = 1
+        
+    #m.setParam('NumericFocus', 1)
+    #m.setParam('Method', 0)
+    #m.setParam('Crossover', 0)
+    #m.setParam('Threads', 8)
+        
+    ### variables    
+    # DA Variables
+    p_G = m.addMVar((grid['n_unit']), vtype = gp.GRB.CONTINUOUS, lb = 0, name = 'p_G')
+    r_up_G = m.addMVar((grid['n_unit']), vtype = gp.GRB.CONTINUOUS, lb = 0, name = 'upward reserve')
+    r_down_G = m.addMVar((grid['n_unit']), vtype = gp.GRB.CONTINUOUS, lb = 0, name = 'downward reserve')
+    
+    # linear decision rules: p(xi) = p_da + W@xi
+    W = m.addMVar((grid['n_unit'], grid['n_wind']), vtype = gp.GRB.CONTINUOUS, lb = -gp.GRB.INFINITY, name = 'linear decision rules')
+    
+    slack_u = m.addMVar((grid['n_loads']), vtype = gp.GRB.CONTINUOUS, lb = 0, name = 'slack_up')
+    slack_d = m.addMVar((grid['n_loads']), vtype = gp.GRB.CONTINUOUS, lb = 0, name = 'slack_down')
+
+    f_margin_up = m.addMVar((grid['n_lines']), vtype = gp.GRB.CONTINUOUS, lb = 0, name = 'upward reserve')
+    f_margin_down = m.addMVar((grid['n_lines']), vtype = gp.GRB.CONTINUOUS, lb = 0, name = 'downward reserve')    
+    flow_da = m.addMVar((grid['n_lines']), vtype = gp.GRB.CONTINUOUS, lb = -gp.GRB.INFINITY)    
+
+    
+    ### DA constraints 
+    m.addConstr( p_G + r_up_G <= Pmax.reshape(-1))
+    m.addConstr( p_G - r_down_G >= 0)
+    
+    # balancing all errors
+    m.addConstr( W.sum(0) == np.ones(grid['n_wind']))
+    
+    # system balancing constraints (could relax this)
+    m.addConstr( p_G.sum() + w_expected.sum() == grid['Pd'].sum())
+    
+    # network constraints (redundant if robust formulation is applied)        
+    m.addConstr(PTDF@(node_G@p_G + node_W@w_expected - node_L@grid['Pd'] ) <= grid['Line_Capacity'].reshape(-1) )
+    m.addConstr(PTDF@(node_G@p_G + node_W@w_expected - node_L@grid['Pd'] ) >= -grid['Line_Capacity'].reshape(-1) )
+
+    #m.addConstr(flow_da == PTDF@(node_G@p_G + node_W@w_expected - node_L@grid['Pd'] ) )
+    #m.addConstr(flow_da <= grid['Line_Capacity'].reshape(-1) )
+    #m.addConstr(flow_da >= -grid['Line_Capacity'].reshape(-1) )
+
+    m.addConstr(grid['Line_Capacity'].reshape(-1) - f_margin_up == PTDF@(node_G@p_G + node_W@w_expected - node_L@grid['Pd'] ) )
+    m.addConstr(grid['Line_Capacity'].reshape(-1) - f_margin_down == -PTDF@(node_G@p_G + node_W@w_expected - node_L@grid['Pd'] ) )
+
+    # robust constraints for all xi 
+    # aux variables
+    aux_g_up = m.addMVar((grid['n_unit'], n_feat) , vtype = gp.GRB.CONTINUOUS, lb = 0)
+    aux_g_down = m.addMVar((grid['n_unit'], n_feat) , vtype = gp.GRB.CONTINUOUS, lb = 0)
+            
+    # upper/lower bound with l-inf norm and primitive uncertainty
+    for g in range(grid['n_unit']):
+        m.addConstr(aux_g_up[g] >= -P@W[g])
+        m.addConstr(aux_g_up[g] >= P@W[g])
+        m.addConstr(aux_g_down[g] >= -P@W[g])
+        m.addConstr(aux_g_down[g] >= P@W[g])
+    
+        m.addConstr( -W[g]@u_nom + rho*aux_g_up[g]@np.ones(n_feat) <= r_up_G[g] )
+        m.addConstr( W[g]@(u_nom) + rho*aux_g_down[g]@np.ones(n_feat) <= r_down_G[g] )
+    
+    #node_inj = m.addMVar((grid['n_nodes'], n_samples), vtype = gp.GRB.CONTINUOUS, lb = -gp.GRB.INFINITY)        
+    if network:
+        # dual variables: per line and per features, for upper/lower bound
+        #lambda_f_up = m.addMVar((grid['n_lines'], num_constr) , vtype = gp.GRB.CONTINUOUS, lb = 0)
+        #lambda_f_down = m.addMVar((grid['n_lines'], num_constr) , vtype = gp.GRB.CONTINUOUS, lb = 0)
+
+        #!!!!!! Error here
+        #  Upper: PTDF@node_g@(-W@xi) + PTDF@node_w@(xi) <= f_up - flow_da, H@xi <= h
+        #  Lower: -PTDF@node_g@(-W@xi) + PTDF@node_w@(xi) <= f_up + flow_da, H@xi <= h
+        # PTDF@node_g@(W@xi) + PTDF@node_w@(xi)
+        # reformulation of robust constraints for line flows
+        #m.addConstr( lambda_f_up@H == PTDF@(-node_G@W + node_W)  )
+        #m.addConstr( h@lambda_f_up.T <= grid['Line_Capacity'] - flow_da )
+
+        #m.addConstr( lambda_f_down@H == -PTDF@(-node_G@W + node_W) )
+        #m.addConstr( h@lambda_f_down.T <= grid['Line_Capacity'] + flow_da)
+                    
+        aux_f_up = m.addMVar((grid['n_lines'], n_feat) , vtype = gp.GRB.CONTINUOUS, lb = 0)
+        aux_f_down = m.addMVar((grid['n_lines'], n_feat) , vtype = gp.GRB.CONTINUOUS, lb = 0)
+                
+        for l in range(grid['n_lines']):
+
+            m.addConstr(aux_f_up[l] >= -(PTDF[l]@(-node_G@W + node_W))@P)
+            m.addConstr(aux_f_up[l] >= (PTDF[l]@(-node_G@W + node_W))@P)
+            m.addConstr(aux_f_down[l] >= -(PTDF[l]@(-node_G@W + node_W))@P)
+            m.addConstr(aux_f_down[l] >= (PTDF[l]@(-node_G@W + node_W))@P)
+        
+            m.addConstr( PTDF[l]@((-node_G@W + node_W)@u_nom) + rho*aux_f_up[g]@np.ones(n_feat) <= grid['Line_Capacity'][l] - flow_da[l] )
+            m.addConstr( -(PTDF[l]@(-node_G@W + node_W)@u_nom) + rho*aux_f_down[g]@np.ones(n_feat) <= grid['Line_Capacity'][l] + flow_da[l] )
+
+        
+                                   
+    m.setObjective( Cost@p_G + C_r_up@r_up_G + C_r_down@r_down_G, gp.GRB.MINIMIZE)             
+    m.optimize()
     try:       
         return m.objVal, p_G.X, r_up_G.X, r_down_G.X, W.X
 
@@ -416,8 +440,49 @@ def robust_dcopf(H, h, w_expected, grid, policy='affine', network = True, slack_
         print('Infeasible solution')
         # scale cost back to aggregate    
         return 1e10, [], []
-            
-            
+
+def create_wind_errors(N, capacity, expected, distr = 'normal', plot = True, std = 0.25, seed = 0):
+    m = len(capacity)
+    errors = np.zeros((N, m))
+
+    # error = actual - expected
+    # max positive error: capacity - expected
+    # min negative error: -expected
+        
+    if distr == 'normal':
+        # multivariate normal
+        std_Pd = std*expected      
+        ub_Pd = capacity
+        lb_Pd = np.zeros(m)
+        
+        mean_Pd = ((ub_Pd-lb_Pd)/2+lb_Pd).reshape(-1)
+        
+        # generate correlation matrix *must be symmetric    
+        np.random.seed(0)
+        a = np.random.rand(m, m)        
+        R = np.tril(a) + np.tril(a, -1).T
+        for i in range(grid['n_wind']): 
+            R[i,i] = 1
+        # estimate covariance matrix
+        S_cov = np.diag(std_Pd)@R@np.diag(std_Pd)        
+        # sample demands, project them into support
+        np.random.seed(seed)
+        samples = np.random.multivariate_normal(np.zeros(mean_Pd.shape[0]), S_cov, size = N_samples).round(2)
+        errors = samples
+
+    # Project back to feasible set
+    for u in range(m):
+        # upper bound/ positive errors == actual - exp >=0
+        errors[:,u][errors[:,u] > capacity[u] - expected[u]] = capacity[u] - expected[u]
+        #lower bound/ negative error == actual - exp <= 0
+        errors[:,u][errors[:,u] < -expected[u]] = -expected[u]
+        
+    # error scatterplot
+    if plot:
+        plt.scatter(errors[:,0], errors[:,1])
+        plt.show()
+    return errors
+         
 #%%
 # parameters of matpower case 5
 
@@ -485,52 +550,21 @@ for u, bus in enumerate(windloc):
 grid['node_L'] = np.eye((grid['n_nodes']))
 #%%
 # create a large set of forecast errors from different wind scenarios
+
 N_samples = 2000
-distr = 'normal'
 
-all_errors = np.zeros((N_samples, grid['n_wind']))
-
-if distr == 'normal':
-    # multivariate normal
-    std_Pd = .25*grid['w_exp']        
-    ub_Pd = grid['w_cap']
-    lb_Pd = np.zeros(len(grid['w_cap']))
-    
-    mean_Pd = ((ub_Pd-lb_Pd)/2+lb_Pd).reshape(-1)
-    
-    # generate correlation matrix *must be symmetric    
-    np.random.seed(0)
-    a = np.random.rand(grid['n_wind'], grid['n_wind'])
-    
-    R = np.tril(a) + np.tril(a, -1).T
-    for i in range(grid['n_wind']): R[i,i] = 1
-    # estimate covariance matrix
-    S_cov = np.diag(std_Pd)@R@np.diag(std_Pd)        
-    # sample demands, project them into support
-    samples = np.random.multivariate_normal(np.zeros(mean_Pd.shape[0]), S_cov, size = N_samples).round(2)
-    all_errors = samples
-    
-# Project back to feasible set
-for u in range(grid['n_wind']):
-    all_errors[:,u][grid['w_exp'][u] - all_errors[:,u] <= 0] = grid['w_exp'][u]
-    all_errors[:,u][grid['w_exp'][u] + all_errors[:,u] >= grid['w_cap'][u]] = grid['w_cap'][u]
-    
-# error scatterplot
-plt.scatter(all_errors[:,0], all_errors[:,1])
-plt.show()
+train_errors = create_wind_errors(N_samples, grid['w_cap'], grid['w_exp'], distr = 'normal', plot = True, std = 0.25, seed = 0)
 
 #%% 
-import itertools
-
 # Data-driven uncertainty box
 
 H_bound = []
 h_bound = []
 
-quantiles = [0.00001, 0.9999999]
+quantiles = [0.01, 0.99]
 
-h_lb = np.quantile(all_errors, quantiles[0], axis = 0).reshape(-1)
-h_ub = np.quantile(all_errors, quantiles[1], axis = 0).reshape(-1)
+h_lb = np.quantile(train_errors, quantiles[0], axis = 0).reshape(-1)
+h_ub = np.quantile(train_errors, quantiles[1], axis = 0).reshape(-1)
 
 #h_ub = np.array([1, 4])
 
@@ -539,7 +573,7 @@ h_bound = np.row_stack((-h_lb, h_ub)).reshape(-1)
 
 fig, ax = plt.subplots(figsize = (6,4))
 
-plt.scatter(all_errors[:,0], all_errors[:,1], alpha = 0.5)
+plt.scatter(train_errors[:,0], train_errors[:,1], alpha = 0.5)
 
 patches = []
     
@@ -556,362 +590,123 @@ ax.add_patch(box)
 plt.show()
 
 # solve robust OPF
-cost_DA, p_DA, r_up, r_down, A = robust_dcopf(H_bound, h_bound, w_exp, grid, loss = 'cost', verbose = -1)
+dd_box_solutions = robust_dcopf_polyhedral(H_bound, h_bound, w_exp, grid, loss = 'cost', verbose = -1)
 
 #%% Box uncertainty with budget/ dual norm
 
+# !!!! need to fix something on the flow constraints to make it equivalent to the above formulation
+#box_cost_DA, box_p_DA, box_r_up, box_r_down, box_A = robust_dcopf_box(h_ub, h_lb, H_bound, h_bound, w_exp, grid, verbose = -1)
+        
 #%% L1 uncertainty set with dual norm and budget
 
-#%% Data-driven polyhedral (accounting for correlation)
+#%% Data-driven L1 uncertainty including correlations
+
+from sklearn.decomposition import PCA
+
+### create transformed features w PCA
+pca = PCA(n_components = train_errors.shape[1]).fit(train_errors)
+pca_features = pca.fit_transform(train_errors)
+
+fig, ax = plt.subplots()
+plt.scatter(pca_features[:,0], pca_features[:,1])
+plt.xlabel('PC1')
+plt.ylabel('PC2')
+plt.title('Decorrelated Errors')
+plt.show()
+#%%
+
+# If x is a column vector, then the linear transformations are:
+# x = A_pca@x_pca + b_pca and x_pca = A_pca_inv@(x-b)
+# if whiten = False at PCA, then the inverse is just the transpose
+# !!!!! if A_pca is scaled, you need to properly invert it (once)
+A_pca = np.zeros((pca_features.shape[1], pca_features.shape[1]))
+A_pca = pca.components_.T
+A_pca_inv = np.linalg.inv(A_pca)
+b_pca = pca.mean_
+
+n_feat = grid['n_wind']
+
+# upper and lower bound of PCs
+
+quantiles = [0.001, 0.999]
+
+pc_lb = np.quantile(pca_features, quantiles[0], axis = 0).reshape(-1)
+pc_ub = np.quantile(pca_features, quantiles[1], axis = 0).reshape(-1)
+        
+    ### Uncertainty set: H@u <= h
+    # If there is no transformation, use upper/lower bound (equivalent to box)
+    # Else, translate the box into polyhedral in the original feature space
+
+pca_map = [A_pca, b_pca, A_pca_inv]
+
+# define polyhedron
+# PC = A.T@(u-b)
+H_id = np.row_stack((np.identity(n_feat), -np.identity(n_feat) ))        
+H_poly = H_id@pca_map[2]
+h_poly = np.array([pc_ub, -pc_lb]).reshape(-1) + H_id@pca_map[2]@pca_map[1]        
+
+
+# solve robust OPF
+dd_poly_solutions = robust_dcopf_polyhedral(H_poly, h_poly, w_exp, grid, verbose = -1)
 
 #%%
 
-# init based on stdv
-mu_init = np.mean(train, axis=0)
-sigma_init =np.std(train, axis=0)/2
+#d = np.linspace(-2,16,300)
+d = np.linspace(-w_cap,w_cap,300)
+x,y = np.meshgrid(d,d)
 
-# percentile-based set paramters/ data-driven intervals
-perc= 10 # in percent
 
-# !!!! equivalent to 10%, 90% quantile of errors
-percupper = np.percentile(train, 100-perc, axis=0)
-perclower = np.percentile(train, perc, axis=0)
+fig, ax = plt.subplots(figsize = (6,4))
 
-# center and intervals of box (see my previous code)
-# see also reformulation with primitive uncertainty factors from Bertsimas, den Hertog
-mu_base_perc = (percupper + perclower) / 2
-sigma_base_perc = mu_init + ((percupper - perclower) / 2)
+plt.scatter(train_errors[:,0], train_errors[:,1], alpha = 0.5)
+
+patches = []
+    
+box_vert = [r for r in itertools.product([h_lb[0], h_ub[0]], 
+                                         [h_lb[1], h_ub[1]])]
+box_vert.insert(2, box_vert[-1])
+box_vert = box_vert[:-1]
+
+box = Polygon(np.array(box_vert), fill = False, 
+                  edgecolor = 'black', linewidth = 3, label = '$\mathcal{U}$')
+patches.append(box)
+ax.add_patch(box)
+
+x = np.linspace(train_errors[:,0].min(), train_errors[:,1].max(), 2000)
+y = [(h_poly[i] - H_poly[i,0]*x)/H_poly[i,1] for i in range(len(H_poly))]
+
+for i in range(len(H_poly)):
+    plt.plot(x, y[i], color = 'black')
+plt.show()
+
+x,y = np.meshgrid(d,d)
+
+plt.imshow( ( (H_poly[0,0]*x + H_poly[0,1]*y <= h_poly[0]) & (H_poly[1,0]*x + H_poly[1,1]*y <= h_poly[1]) &
+             (H_poly[2,0]*x + H_poly[2,1]*y <= h_poly[2]) & (H_poly[3,0]*x + H_poly[3,1]*y <= h_poly[3]) ).astype(int) , 
+                extent=(x.min(),x.max(),y.min(),y.max()), origin="lower", cmap="Greys", alpha = 0.3)
+plt.show()
+
+#%% Out-of-sample test
+
+N_test = 2000
+distr = 'normal'
+
+test_errors = create_wind_errors(N_test, grid['w_cap'], grid['w_exp'], std = 0.25, seed = 1)
+
 
 #%%
-prob, _, theparams, _ = box_robust_dcopf_problem_param(mu_init, sigma_init, d, w, allow_slack=False, quadratic_cost=True)
-prob.solve(solver="ECOS")
 
-# test feasibility for a few random scenarios
-d_range = [0.5, 1.1]
-w_range = [0.5, 1.1]
-d_scenario = np.random.uniform(*d_range, B) * d
-w_scenario = np.random.uniform(*w_range, D) * w
+output = pd.DataFrame(data = [], columns = ['DA_cost', 'RT_cost'], index = ['DD_box', 'DD_poly'])
 
-theparams[0].value = d_scenario
-theparams[1].value = w_scenario
-prob.solve(solver='ECOS', warm_start=True)
-print(prob.status)
-print(f'Objective value:  {prob.value:.4f}') 
+dd_box_rtcost = oos_cost_estimation(test_errors, dd_box_solutions, grid, c_viol = 2*1e2)
 
-#%% COST-BASED LOSS
-# loss function
+output.loc['DD_box']['DA_cost'] = dd_box_solutions['da_cost']
+output.loc['DD_box']['RT_cost'] = dd_box_rtcost
 
-# use relu to discard negative values
-nonneg = torch.nn.ReLU(inplace=False)
+output.loc['DD_poly']['DA_cost'] = dd_poly_solutions['da_cost']
+output.loc['DD_poly']['RT_cost'] = oos_cost_estimation(test_errors, dd_poly_solutions, grid, c_viol = 2*1e2)
 
-# some additonal settings
-LR = 5e-6
-LMOM = 0.3
-GAMMA = 0.
-cM = 2000
-BATCHSIZE = 64
-
-# reset randomness
-np.random.seed(seed=SEED)
-
-#### SINGLE
-
-# prepare parameters 
-cE_tch = torch.tensor(cE, dtype=DTYPE)
-cR_tch = torch.tensor(cR, dtype=DTYPE)
-cM_tch = torch.tensor(cM, dtype=DTYPE)
-ptdf_tch = torch.tensor(ptdf, dtype=DTYPE)
-gen2bus_tch = torch.tensor(gen2bus, dtype=DTYPE)
-wind2bus_tch = torch.tensor(wind2bus, dtype=DTYPE)
-zero_tch = torch.tensor(0, dtype=DTYPE)
-
-# set up the layer
-inner, vs, params, consts = box_robust_dcopf_problem_param(mu_init, sigma_init, d, w, gamma=GAMMA, allow_slack=True, quadratic_cost=False)
-inner_cvxpylayer = CvxpyLayer(inner, parameters=inner.parameters(), variables=inner.variables())
-
-# set up base model for comparison
-base_prob, _, _, _ = box_robust_dcopf_problem_param(mu_base_perc, sigma_base_perc, d, w, gamma=GAMMA, allow_slack=True, quadratic_cost=False)
-
-# set up the prescriptor
-sigma_tch = torch.tensor(sigma_init, dtype=DTYPE, requires_grad=True)
-mu_tch = torch.tensor(mu_init, dtype=DTYPE, requires_grad=True)
-
-# set up SGD 
-opt = torch.optim.SGD([mu_tch, sigma_tch], lr=LR, momentum=LMOM) 
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=5)
-
-#train
-loss_during_training = []
-training_data_df = pd.DataFrame()
-with trange(MAX_EPOCH) as ep_looper:
-    for epoch in ep_looper:
-        ep_looper.set_description(f'Epoch {epoch}')
-        
-        # reset loss
-        loss = torch.tensor(0., dtype=DTYPE)
-        
-        for batch in range(BATCHSIZE):
-            # create net demand scenario 
-            d_scenario_np = np.random.uniform(*d_range, B) * d + 1e-7
-            d_scenario = torch.tensor(d_scenario_np, dtype=DTYPE)
-            w_scenario_np = np.random.uniform(*w_range, D) * w + 1e-7
-            w_scenario = torch.tensor(w_scenario_np, dtype=DTYPE)
-            scenario_vector = torch.cat((d_scenario, w_scenario))
-        
-            # compute current inner solution
-            opf_params = [w_scenario, d_scenario, mu_tch, sigma_tch]
-            try:
-                var_values = inner_cvxpylayer(*opf_params,  solver_args={'solve_method': "ECOS", 'max_iters':20_000})
-            except:
-                print('infeasibility')
-                continue
-            # calculate loss
-            temploss = expected_cost(var_values, train_data, gamma=GAMMA)
-            loss = loss + temploss/BATCHSIZE
-            
-        # backpropagate
-        loss.backward()
-
-        # step the SGD
-        opt.step()
-        opt.zero_grad()
-        scheduler.step(loss)
-        
-        # some analysis and reporting
-        current_results = pd.Series({
-            "epoch": epoch,
-            "loss": loss.item(),
-            "mu": mu_tch.detach().numpy(),
-            "sigma": sigma_tch.detach().numpy(),
-        })
-        training_data_df = pd.concat([training_data_df, current_results.to_frame().T], ignore_index=True)
-        loss_during_training.append(loss.item())
-        ep_looper.set_postfix(loss=loss.item())
-        
-results_without_prescription = training_data_df.copy()
-            
-# some final reporting    
-fig, ax = plt.subplots(1,1)
-ax.plot(loss_during_training, label='train')
-ax.set_ylabel('loss')
-ax.set_xlabel('step')
-ax.legend()
-
-
-#%% P-ALL
-
-# some additonal settings
-LR = 1e-6
-LMOM = 0.3
-GAMMA = 0.1
-cM = 2000
-
-# reset randomness
-np.random.seed(seed=SEED)
-
-# prepare parameters 
-cE_tch = torch.tensor(cE, dtype=DTYPE)
-cR_tch = torch.tensor(cR, dtype=DTYPE)
-cM_tch = torch.tensor(cM, dtype=DTYPE)
-ptdf_tch = torch.tensor(ptdf, dtype=DTYPE)
-gen2bus_tch = torch.tensor(gen2bus, dtype=DTYPE)
-wind2bus_tch = torch.tensor(wind2bus, dtype=DTYPE)
-zero_tch = torch.tensor(0, dtype=DTYPE)
-
-# set up the layer
-inner, vs, params, consts = box_robust_dcopf_problem_param(mu_init, sigma_init, d, w, gamma=GAMMA, allow_slack=True, quadratic_cost=False)
-inner_cvxpylayer = CvxpyLayer(inner, parameters=inner.parameters(), variables=inner.variables())
-
-# set up base model for comparison
-base_prob, _, _, _ = box_robust_dcopf_problem_param(mu_base_perc, sigma_base_perc, d, w, gamma=GAMMA, allow_slack=True, quadratic_cost=False)
-
-# set up the prescriptor
-sigma_prescriptor = torch.nn.Linear(B+D, D)
-sigma_prescriptor.weight.data = torch.zeros((D, B+D))
-sigma_prescriptor.bias.data = torch.tensor(sigma_init, dtype=DTYPE)
-mu_prescriptor = torch.nn.Linear(B+D, D)
-mu_prescriptor.weight.data = torch.zeros((D, B+D))
-mu_prescriptor.bias.data = torch.tensor(mu_init, dtype=DTYPE)
-
-# set up SGD 
-parameters = list(mu_prescriptor.parameters()) + list(sigma_prescriptor.parameters())
-opt = torch.optim.SGD(parameters, lr=LR, momentum=LMOM) 
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=5)
-
-#train
-loss_during_training = []
-training_data_df = pd.DataFrame()
-with trange(MAX_EPOCH) as ep_looper:
-    for epoch in ep_looper:
-        ep_looper.set_description(f'Epoch {epoch}')
-        
-        # reset loss
-        loss = torch.tensor(0., dtype=DTYPE)
-        oosloss = torch.tensor(0., dtype=DTYPE)
-        baseloss = torch.tensor(0., dtype=DTYPE)
-    
-        for batch in range(BATCHSIZE):
-            # create net demand scenario 
-            d_scenario_np = np.random.uniform(*d_range, B) * d
-            d_scenario = torch.tensor(d_scenario_np, dtype=DTYPE)
-            w_scenario_np = np.random.uniform(*w_range, D) * w
-            w_scenario = torch.tensor(w_scenario_np, dtype=DTYPE)
-            scenario_vector = torch.cat((d_scenario, w_scenario))
-            
-            # prescribe the the set size
-            mu = mu_prescriptor(scenario_vector.float())
-            sigma = sigma_prescriptor(scenario_vector.float())
-        
-            # compute current inner solution
-            opf_params = [w_scenario, d_scenario, mu, sigma]
-            var_values = inner_cvxpylayer(*opf_params,  solver_args={'solve_method': "ECOS"})
-            
-            # calculate loss
-            temploss = expected_cost(var_values, train_data, gamma=GAMMA)
-            loss = loss + temploss/BATCHSIZE
-              
-        # backpropagate
-        loss.backward()
-
-        # step the SGD
-        opt.step()
-        opt.zero_grad()
-        scheduler.step(loss)
-        
-        # some analysis and reporting
-        current_results = pd.Series({
-            "epoch": epoch,
-            "loss": loss.item(),
-            "mu_pres_weight": mu_prescriptor.weight.data.detach(),
-            "mu_pres_bias": mu_prescriptor.bias.data.detach(),
-            "sigma_pres_weight": sigma_prescriptor.weight.data.detach(),
-            "sigma_pres_bias": sigma_prescriptor.bias.data.detach(),
-        })
-        training_data_df = pd.concat([training_data_df, current_results.to_frame().T], ignore_index=True)
-        loss_during_training.append(loss.item())
-        ep_looper.set_postfix(loss=loss.item())
-
-results_with_prescription = training_data_df.copy()
-            
-# some final reporting    
-fig, ax = plt.subplots(1,1)
-ax.plot(loss_during_training, label='train')
-ax.set_ylabel('loss')
-ax.set_xlabel('step')
-ax.legend()
-
-#%% OOS testing
-# in oos gamma is always zero
-GAMMA = 0.
-cM = 2000
-
-# get final training
-def get_prescriptors(training_results):
-    final_training_epoch = training_results.iloc[-1]
-    sigma_prescriptor = torch.nn.Linear(B+D, D)
-    sigma_prescriptor.weight.data = final_training_epoch.sigma_pres_weight
-    sigma_prescriptor.bias.data = final_training_epoch.sigma_pres_bias
-    mu_prescriptor = torch.nn.Linear(B+D, D)
-    mu_prescriptor.weight.data = final_training_epoch.mu_pres_weight
-    mu_prescriptor.bias.data = final_training_epoch.mu_pres_bias
-    return mu_prescriptor, sigma_prescriptor
-
-# create model
-prob, thevars, theparams, _ = box_robust_dcopf_problem_param(mu_init, sigma_init, d, w, gamma=GAMMA, allow_slack=True, quadratic_cost=False)
-
-pu_scale = 100
-N_OOS = 500
-oos_loss_base = []
-oos_loss_full = []
-oos_loss_single = []
-oos_loss_presc = []
-oos_loss_presc_cond = []
-oos_loss_presc_imp_cond = []
-for oos in trange(N_OOS):
-
-    # create a scenario
-    d_scenario_np = np.random.uniform(*d_range, B) * d
-    w_scenario_np = np.random.uniform(*w_range, D) * w
-    d_scenario = torch.tensor(d_scenario_np, dtype=DTYPE)
-    w_scenario = torch.tensor(w_scenario_np, dtype=DTYPE)
-    scenario_vector = torch.cat((d_scenario, w_scenario))
-    # create a single error occurence
-    cur_error = create_historical_data(w_scenario_np, N=12, corr=CORR)
-    cur_data = torch.tensor(cur_error, dtype=DTYPE)
-
-    ## base model
-    theparams[0].value = d_scenario_np
-    theparams[1].value = w_scenario_np
-    theparams[2].value = mu_base_perc
-    theparams[3].value = sigma_base_perc
-    prob.solve(solver='ECOS', warm_start=True)
-    var_values = [torch.tensor(v.value, dtype=DTYPE) for v in thevars]
-    # compute loss for the prescribed model
-    loss_base = expected_cost(var_values, cur_data, gamma=GAMMA)
-    oos_loss_base.append(loss_base.item() * pu_scale)
-    
-    ## full robust
-    mine = np.min(train, axis=0)
-    maxe = np.min(train, axis=0)
-    theparams[2].value = (maxe + mine) / 2
-    theparams[3].value = mu_init + ((maxe - mine) / 2)
-    prob.solve(solver='ECOS', warm_start=True)
-    var_values = [torch.tensor(v.value, dtype=DTYPE) for v in thevars]
-    # compute loss for the prescribed model
-    loss_full = expected_cost(var_values, cur_data, gamma=GAMMA)
-    oos_loss_full.append(loss_full.item() * pu_scale)
-    
-    ## one size fits all
-    final_epoch = results_without_prescription.iloc[-1]
-    theparams[2].value = final_epoch.mu
-    theparams[3].value = final_epoch.sigma
-    prob.solve(solver='ECOS', warm_start=True)
-    var_values = [torch.tensor(v.value, dtype=DTYPE) for v in thevars]
-    # compute loss for the prescribed model
-    loss_single = expected_cost(var_values, cur_data, gamma=GAMMA)
-    oos_loss_single.append(loss_single.item() * pu_scale)
-    
-    ## prescribed model
-    # parametrize prescribed model
-    mu_presc, sigma_presc = get_prescriptors(results_with_prescription)
-    # mu_presc, sigma_presc = get_prescriptors(results_with_prescription_outer_sample)
-    theparams[2].value = mu_presc(scenario_vector).detach().numpy()
-    theparams[3].value = sigma_presc(scenario_vector).detach().numpy()
-    prob.solve(solver='ECOS', warm_start=True)
-    var_values = [torch.tensor(v.value, dtype=DTYPE) for v in thevars]
-    # compute loss for the prescribed model
-    loss_presc = expected_cost(var_values, cur_data, gamma=GAMMA)
-    oos_loss_presc.append(loss_presc.item() * pu_scale)
-    
-    ## prescribed model with perfect knowledge of conditional distributon
-    mu_presc_cond, sigma_presc_cond = get_prescriptors(results_with_prescription_and_cond_error)
-    theparams[2].value = mu_presc_cond(scenario_vector).detach().numpy()
-    theparams[3].value = sigma_presc_cond(scenario_vector).detach().numpy()
-    prob.solve(solver='ECOS', warm_start=True)
-    var_values = [torch.tensor(v.value, dtype=DTYPE) for v in thevars]
-    # compute loss for the prescribed model
-    loss_presc_cond = expected_cost(var_values, cur_data, gamma=GAMMA)
-    oos_loss_presc_cond.append(loss_presc_cond.item() * pu_scale)
-    
-    ## prescribed model with IMperfect knowledge of conditional distributon
-    mu_presc_imp_cond, sigma_presc_imp_cond = get_prescriptors(results_with_prescription_and_imp_cond_error)
-    theparams[2].value = mu_presc_imp_cond(scenario_vector).detach().numpy()
-    theparams[3].value = sigma_presc_imp_cond(scenario_vector).detach().numpy()
-    prob.solve(solver='ECOS', warm_start=True)
-    var_values = [torch.tensor(v.value, dtype=DTYPE) for v in thevars]
-    # compute loss for the prescribed model
-    loss_presc_imp_cond = expected_cost(var_values, cur_data, gamma=GAMMA)
-    oos_loss_presc_imp_cond.append(loss_presc_imp_cond.item() * pu_scale)
-
-    
-for ci,cn in enumerate(['B', 'Full', 'OSFA', 'P', 'PC', 'PIPC']):
-    curec = np.mean([oos_loss_base, oos_loss_full, oos_loss_single, oos_loss_presc, oos_loss_presc_cond, oos_loss_presc_imp_cond][ci])
-    print(f'Expected cost case {cn}: {curec:.3f}')
-
-
-
-
-
-
-
+fig, ax = plt.subplots()
+output.T.plot(kind = 'bar', ax = ax)
+plt.show()
 

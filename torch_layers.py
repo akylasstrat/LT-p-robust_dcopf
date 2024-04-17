@@ -339,7 +339,7 @@ class Robust_OPF(nn.Module):
             if epoch%10 == 0:
                 
                 fig, ax = plt.subplots(figsize = (6,4))
-                x = np.linspace(-3, 3, 1000)
+                x = np.linspace(-2, 2, 1000)
                 
                 H_np = to_np(self.H)
                 h_np = to_np(self.h)
@@ -347,10 +347,15 @@ class Robust_OPF(nn.Module):
                 y = [(h_np[i] - H_np[i,0]*x)/H_np[i,1] for i in range(len(H_np))]
                 
 
-                plt.scatter(y_batch[:,0], y_batch[:,1])
+                plt.scatter(y_batch[:,0], y_batch[:,1], label = '_nolegend_')
                 for i in range(len(H_np)):
-                    plt.plot(x, y[i], color = 'black')
+                    plt.plot(x, y[i], color = 'tab:green')
                 plt.ylim([-2, 2])
+                plt.xlim([-2, 2])
+                plt.title(f'C_viol = {self.c_viol} \$/MWh, Iteration: {epoch}', fontsize = 12)
+                plt.xlabel('Error 1')
+                plt.xlabel('Error 2')
+                plt.legend([f'Ineq. {i}' for i in range(self.num_constr)], fontsize = 12, ncol = 2)
                 plt.show()
                 
             average_train_loss = running_loss / len(train_loader)

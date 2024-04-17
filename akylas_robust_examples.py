@@ -552,12 +552,18 @@ grid['node_L'] = np.eye((grid['n_nodes']))
 # create a large set of forecast errors from different wind scenarios
 
 N_samples = 2000
-
+c_viol = 100
 train_errors = create_wind_errors(N_samples, grid['w_cap'], grid['w_exp'], distr = 'normal', plot = True, std = 0.25, seed = 0)
 
-#%% 
-# Data-driven uncertainty box
 
+# Upper and lower bounds for errors
+
+UB = grid['w_cap'] - grid['w_exp']
+LB = - grid['w_exp']
+
+#%% 
+
+# Data-driven uncertainty box
 H_bound = []
 h_bound = []
 
@@ -569,26 +575,44 @@ h_ub = np.quantile(train_errors, quantiles[1], axis = 0).reshape(-1)
 #h_ub = np.array([1, 4])
 
 H_bound = np.row_stack((-np.eye(grid['n_wind']), np.eye(grid['n_wind'])))
-h_bound = np.row_stack((-h_lb, h_ub)).reshape(-1)
+h_dd_box = np.row_stack((-h_lb, h_ub)).reshape(-1)
+
+h_bound = np.row_stack((-LB, UB)).reshape(-1)
+
 
 fig, ax = plt.subplots(figsize = (6,4))
 
 plt.scatter(train_errors[:,0], train_errors[:,1], alpha = 0.5)
 
-patches = []
-    
+# data-driven box
+patches = []    
 box_vert = [r for r in itertools.product([h_lb[0], h_ub[0]], 
                                          [h_lb[1], h_ub[1]])]
 box_vert.insert(2, box_vert[-1])
 box_vert = box_vert[:-1]
 
-box = Polygon(np.array(box_vert), fill = False, 
-                  edgecolor = 'black', linewidth = 3, label = '$\mathcal{U}$')
+box = Polygon(np.array(box_vert), fill = False, edgecolor = 'black', linewidth = 2, label = 'DD Box$_{98\%}$')
 patches.append(box)
 ax.add_patch(box)
-plt.ylim([-2, 2])
-plt.show()
 
+# full box
+patches = []    
+box_vert = [r for r in itertools.product([LB[0], UB[0]], [LB[1], UB[1]])]
+box_vert.insert(2, box_vert[-1])
+box_vert = box_vert[:-1]
+
+box = Polygon(np.array(box_vert), fill = False, 
+                  edgecolor = 'black', linestyle = '--', linewidth = 2, label = 'Full Box')
+patches.append(box)
+ax.add_patch(box)
+
+plt.ylim([-2, 2])
+plt.xlim([-2, 2])
+plt.legend(fontsize = 12, ncol = 2)
+plt.xlabel('Error 1')
+plt.ylabel('Error 2')
+plt.show()
+#%%
 # solve robust OPF
 dd_box_solutions = robust_dcopf_polyhedral(H_bound, h_bound, w_exp, grid, loss = 'cost', verbose = -1)
 
@@ -628,7 +652,7 @@ n_feat = grid['n_wind']
 
 # upper and lower bound of PCs
 
-quantiles = [0.001, 0.999]
+quantiles = [0.01, 0.99]
 
 pc_lb = np.quantile(pca_features, quantiles[0], axis = 0).reshape(-1)
 pc_ub = np.quantile(pca_features, quantiles[1], axis = 0).reshape(-1)
@@ -661,24 +685,42 @@ fig, ax = plt.subplots(figsize = (6,4))
 plt.scatter(train_errors[:,0], train_errors[:,1], alpha = 0.5)
 
 patches = []
-    
-box_vert = [r for r in itertools.product([h_lb[0], h_ub[0]], 
-                                         [h_lb[1], h_ub[1]])]
+
+# data-driven box    
+dd_box_vert = [r for r in itertools.product([h_lb[0], h_ub[0]], [h_lb[1], h_ub[1]])]
+dd_box_vert.insert(2, dd_box_vert[-1])
+dd_box_vert = dd_box_vert[:-1]
+
+
+dd_box = Polygon(np.array(dd_box_vert), fill = False, edgecolor = 'black', linewidth = 3, label = 'DD Box$_{98\%}$')
+patches.append(dd_box)
+ax.add_patch(dd_box)
+
+# full box support   
+box_vert = [r for r in itertools.product([LB[0], UB[0]], [LB[1], UB[1]])]
 box_vert.insert(2, box_vert[-1])
 box_vert = box_vert[:-1]
 
-box = Polygon(np.array(box_vert), fill = False, 
-                  edgecolor = 'black', linewidth = 3, label = '$\mathcal{U}$')
+box = Polygon(np.array(box_vert), fill = False, edgecolor = 'black', linestyle = '--', linewidth = 3, label = 'Full support')
 patches.append(box)
 ax.add_patch(box)
 
+# polyhedron
 x = np.linspace(train_errors[:,0].min(), train_errors[:,1].max(), 2000)
 y = [(h_poly[i] - H_poly[i,0]*x)/H_poly[i,1] for i in range(len(H_poly))]
 
 for i in range(len(H_poly)):
-    plt.plot(x, y[i], color = 'black')
+    if i ==0:
+        plt.plot(x, y[i], color = 'tab:orange', label = 'DD Polyhedron')
+    else:
+        plt.plot(x, y[i], color = 'tab:orange', label='_nolegend_')
+        
+plt.ylim([-2, 2])
+plt.xlim([-2, 2])
+plt.legend()
 plt.show()
 
+#%%
 x,y = np.meshgrid(d,d)
 
 plt.imshow( ( (H_poly[0,0]*x + H_poly[0,1]*y <= h_poly[0]) & (H_poly[1,0]*x + H_poly[1,1]*y <= h_poly[1]) &
@@ -694,10 +736,6 @@ distr = 'normal'
 
 test_errors = create_wind_errors(N_test, grid['w_cap'], grid['w_exp'], std = 0.25, seed = 1)
 
-
-
-#%%
-
 output = pd.DataFrame(data = [], columns = ['DA_cost', 'RT_cost'], index = ['DD_box', 'DD_poly'])
 
 dd_box_rtcost = oos_cost_estimation(test_errors, dd_box_solutions, grid, c_viol = 2*1e2)
@@ -706,7 +744,7 @@ output.loc['DD_box']['DA_cost'] = dd_box_solutions['da_cost']
 output.loc['DD_box']['RT_cost'] = dd_box_rtcost
 
 output.loc['DD_poly']['DA_cost'] = dd_poly_solutions['da_cost']
-output.loc['DD_poly']['RT_cost'] = oos_cost_estimation(test_errors, dd_poly_solutions, grid, c_viol = 2*1e2)
+output.loc['DD_poly']['RT_cost'] = oos_cost_estimation(test_errors, dd_poly_solutions, grid, c_viol = c_viol)
 
 fig, ax = plt.subplots()
 output.T.plot(kind = 'bar', ax = ax)
@@ -714,8 +752,8 @@ plt.show()
 
 #%% Cost-based learning of a polytope
 
-UB = grid['w_cap'] - grid['w_exp'] - 1
-LB = - grid['w_exp'] + 1
+UB_init = grid['w_cap'] - grid['w_exp'] - 1
+LB_init = - grid['w_exp'] + 1
 
 from torch_layers import *
 
@@ -728,7 +766,7 @@ tensor_trainY = torch.FloatTensor(train_errors)
 train_data_loader = create_data_loader([tensor_trainY], batch_size = batch_size)
 valid_data_loader = create_data_loader([tensor_trainY], batch_size = batch_size)
 
-robust_opf_model = Robust_OPF(grid['n_wind'], 4, grid, UB, LB, c_viol = 2*1e2, add_fixed_box = False)
+robust_opf_model = Robust_OPF(grid['n_wind'], 4, grid, UB_init, LB_init, c_viol = c_viol, add_fixed_box = False)
 optimizer = torch.optim.Adam(robust_opf_model.parameters(), lr = 1e-2)
 robust_opf_model.train_model(train_data_loader, valid_data_loader, optimizer, epochs = num_epoch, patience = patience, validation = False)
 
@@ -748,17 +786,54 @@ temp_cost.loc['CostDriven_poly']['DA_cost'] = dd_cost_poly_solutions['da_cost']
 temp_cost.loc['CostDriven_poly']['RT_cost'] = cost_driven_rtcost
 output = output.append(temp_cost)
 
-fig, ax = plt.subplots()
-output.T.plot(kind = 'bar', ax = ax)
-plt.show()
+# Plot everything
+fig, ax = plt.subplots(figsize = (6,4))
 
+plt.scatter(train_errors[:,0], train_errors[:,1], alpha = 0.5)
+
+patches = []
+
+# data-driven box    
+dd_box_vert = [r for r in itertools.product([h_lb[0], h_ub[0]], [h_lb[1], h_ub[1]])]
+dd_box_vert.insert(2, dd_box_vert[-1])
+dd_box_vert = dd_box_vert[:-1]
+
+
+dd_box = Polygon(np.array(dd_box_vert), fill = False, edgecolor = 'black', linewidth = 3, label = 'DD Box$_{98\%}$')
+patches.append(dd_box)
+ax.add_patch(dd_box)
+
+# full box support   
+box_vert = [r for r in itertools.product([LB[0], UB[0]], [LB[1], UB[1]])]
+box_vert.insert(2, box_vert[-1])
+box_vert = box_vert[:-1]
+
+box = Polygon(np.array(box_vert), fill = False, edgecolor = 'black', linestyle = '--', linewidth = 3, label = 'Full Support')
+patches.append(box)
+ax.add_patch(box)
+
+# polyhedron
 x = np.linspace(train_errors[:,0].min(), train_errors[:,1].max(), 2000)
+y = [(h_poly[i] - H_poly[i,0]*x)/H_poly[i,1] for i in range(len(H_poly))]
 
-plt.scatter(train_errors[:,0], train_errors[:,1])
+for i in range(len(H_poly)):
+    if i ==0:
+        plt.plot(x, y[i], color = 'tab:orange', label = 'DD Poly')
+    else:
+        plt.plot(x, y[i], color = 'tab:orange', label='_nolegend_')
+        
+
+# cost-driven polyhedron
 y = [(h_cost[i] - H_cost[i,0]*x)/H_cost[i,1] for i in range(robust_opf_model.num_constr)]
 for i in range(robust_opf_model.num_constr):
-    plt.plot(x, y[i], color = 'black')
+    if i== 0:
+        plt.plot(x, y[i], color = 'tab:green', label = 'Cost-driven Poly')
+    else:
+        plt.plot(x, y[i], color = 'tab:green')
+    
 plt.ylim([-2, 2])
+plt.xlim([-2, 2])
+plt.legend(fontsize = 10, ncol = )
 plt.show()
 
 

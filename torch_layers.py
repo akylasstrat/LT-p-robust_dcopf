@@ -47,7 +47,8 @@ def create_data_loader(inputs, batch_size, num_workers=0, shuffle=True):
                 
 class Robust_OPF(nn.Module):        
     
-    def __init__(self, num_uncertainties, num_constr, grid, UB, LB, c_viol = 2*1e4, regularization = 0, include_network = True):
+    def __init__(self, num_uncertainties, num_constr, grid, UB_initial, LB_initial, c_viol = 2*1e4, regularization = 0, include_network = True, 
+                 add_fixed_box = True):
         super(Robust_OPF, self).__init__()
         
         Pmax = grid['Pmax']
@@ -84,14 +85,24 @@ class Robust_OPF(nn.Module):
         self.num_constr = num_constr
         
         # Parameters to be estimated (initialize at the extremes of the box)
-                
-        H_init = np.row_stack((-np.eye(num_uncertainties), np.eye(num_uncertainties)))
-        h_init = np.row_stack((-LB, UB)).reshape(-1)
         
-        for i in range(num_constr - len(h_init)):
-            h_init = np.row_stack((h_init.reshape(-1,1), np.zeros((1,1)) ) ).reshape(-1)
-            H_init = np.row_stack((H_init, np.random.randn(1, num_uncertainties)) ) 
+        # Initialize with upper & lower bounds for each uncertainty (2*num_uncertainties total constraints)
+        H_init = np.row_stack((-np.eye(num_uncertainties), np.eye(num_uncertainties)))
+        h_init = np.row_stack((-LB_initial, UB_initial)).reshape(-1)
 
+        #H_init = H_init + np.random.normal(loc = 0, scale = 0.1, size = H_init.shape)
+        #h_init = h_init + np.random.normal(loc = 0, scale = 0.1, size = h_init.shape)
+        
+        #H_init = np.vstack(2*[H_init])
+        #h_init = np.tile(h_init, 2)
+        
+        # Initialize additional constraints with some noise
+        for i in range(num_constr - len(h_init)):
+            
+            ind = i%(2*num_uncertainties)            
+            
+            h_init = np.row_stack((h_init.reshape(-1,1), h_init[ind]*np.ones((1,1)) + np.random.normal(loc=0, scale=0.01) ) ).reshape(-1)
+            H_init = np.row_stack((H_init, H_init[ind:ind+1,:] + np.random.normal(loc=0, scale=0.01, size = (1, H_init.shape[1] )) )) 
         #H_init = np.zeros((num_constr, num_uncertainties))
         #h_init = np.zeros(num_constr)
         print(H_init.shape)
@@ -99,7 +110,14 @@ class Robust_OPF(nn.Module):
         
         self.H = nn.Parameter(torch.FloatTensor(H_init).requires_grad_())
         self.h = nn.Parameter(torch.FloatTensor(h_init).requires_grad_())
+        
+        # fix the box uncertainty on the support
+        H_box = np.row_stack((-np.eye(num_uncertainties), np.eye(num_uncertainties)))
+        h_box = np.row_stack((-LB_initial, UB_initial)).reshape(-1)
 
+        self.H_fixed = torch.FloatTensor(H_box)
+        self.h_fixed = torch.FloatTensor(h_box)
+        
         #H_bound = np.row_stack((-np.eye(grid['n_wind']), np.eye(grid['n_wind'])))
         #h_bound = np.row_stack((-h_lb, h_ub)).reshape(-1)
 
@@ -157,16 +175,43 @@ class Robust_OPF(nn.Module):
                          lambda_f_up@H_param == PTDF@(-node_G@W + node_W), h_param@lambda_f_up.T <= f_margin_up, 
                          lambda_f_down@H_param == -PTDF@(-node_G@W + node_W), h_param@lambda_f_down.T <= f_margin_down]
 
-
-                 
+        
         DA_cost_expr = Cost@p_G + C_r_up@r_up_G + C_r_down@r_down_G
         objective_funct = cp.Minimize( DA_cost_expr ) 
-                
-        robust_opf_problem = cp.Problem(objective_funct, DA_constraints + Robust_constr)
-         
-        self.robust_opf_layer = CvxpyLayer(robust_opf_problem, parameters=[H_param, h_param],
-                                           variables = [p_G, r_up_G, r_down_G, W, f_margin_up, f_margin_down, 
-                                                        lambda_up, lambda_down, lambda_f_up, lambda_f_down] )
+
+        if add_fixed_box:
+            # fixed robust constraints
+            # additional variables for generator limits
+            lambda_up_fix = cp.Variable((grid['n_unit'], 2*num_uncertainties), nonneg = True)
+            lambda_down_fix = cp.Variable((grid['n_unit'], 2*num_uncertainties), nonneg = True)
+    
+            # additional variables for line margins
+            lambda_f_up_fix = cp.Variable((grid['n_lines'], 2*num_uncertainties), nonneg = True)
+            lambda_f_down_fix = cp.Variable((grid['n_lines'], 2*num_uncertainties), nonneg = True)
+            
+            fix_rob_var = [lambda_up_fix,lambda_down_fix, lambda_f_up_fix, lambda_f_down_fix]
+            # Reformulation of robust constraints
+            # downward reserve bound/ each row are the duals to reformulate each constraints
+            
+            Robust_constr_fix = [ lambda_down_fix@self.H_fixed == W, self.h_fixed@lambda_down_fix.T <= r_down_G, 
+                             lambda_up_fix@self.H_fixed  == -W, self.h_fixed@lambda_up_fix.T <= r_up_G, 
+                             lambda_f_up_fix@self.H_fixed  == PTDF@(-node_G@W + node_W), self.h_fixed@lambda_f_up_fix.T <= f_margin_up, 
+                             lambda_f_down_fix@self.H_fixed  == -PTDF@(-node_G@W + node_W), self.h_fixed@lambda_f_down_fix.T <= f_margin_down]
+
+
+            robust_opf_problem = cp.Problem(objective_funct, DA_constraints + Robust_constr + Robust_constr_fix)
+             
+            self.robust_opf_layer = CvxpyLayer(robust_opf_problem, parameters=[H_param, h_param],
+                                               variables = [p_G, r_up_G, r_down_G, W, f_margin_up, f_margin_down, 
+                                                            lambda_up, lambda_down, lambda_f_up, lambda_f_down] + fix_rob_var )
+                 
+        else:
+                    
+            robust_opf_problem = cp.Problem(objective_funct, DA_constraints + Robust_constr)
+             
+            self.robust_opf_layer = CvxpyLayer(robust_opf_problem, parameters=[H_param, h_param],
+                                               variables = [p_G, r_up_G, r_down_G, W, f_margin_up, f_margin_down, 
+                                                            lambda_up, lambda_down, lambda_f_up, lambda_f_down])
                                         
         
         ###### Additional layer to estimate real-time cost

@@ -719,8 +719,8 @@ LB = - grid['w_exp'] + 1
 
 from torch_layers import *
 
-patience = 100
-batch_size = 2000
+patience = 25
+batch_size = 200
 num_epoch = 1000
 
 tensor_trainY = torch.FloatTensor(train_errors)
@@ -728,9 +728,39 @@ tensor_trainY = torch.FloatTensor(train_errors)
 train_data_loader = create_data_loader([tensor_trainY], batch_size = batch_size)
 valid_data_loader = create_data_loader([tensor_trainY], batch_size = batch_size)
 
-robust_opf_model = Robust_OPF(grid['n_wind'], 4, grid, UB, LB, c_viol = 100)
+robust_opf_model = Robust_OPF(grid['n_wind'], 5, grid, UB, LB, c_viol = 2*1e2, add_fixed_box = False)
 optimizer = torch.optim.Adam(robust_opf_model.parameters(), lr = 1e-2)
 robust_opf_model.train_model(train_data_loader, valid_data_loader, optimizer, epochs = num_epoch, patience = patience, validation = False)
+
+#%% resolve using learned polyhedral
+
+# learned parameters 
+
+H_cost = robust_opf_model.H.detach().numpy()
+h_cost = robust_opf_model.h.detach().numpy()
+
+dd_cost_poly_solutions = robust_dcopf_polyhedral(H_cost, h_cost, w_exp, grid, verbose = -1)
+
+temp_cost = pd.DataFrame(data = [], columns = ['DA_cost', 'RT_cost'], index = ['CostDriven_poly'])
+cost_driven_rtcost = oos_cost_estimation(test_errors, dd_cost_poly_solutions, grid, c_viol = 2*1e2)
+
+temp_cost.loc['CostDriven_poly']['DA_cost'] = dd_cost_poly_solutions['da_cost']
+temp_cost.loc['CostDriven_poly']['RT_cost'] = cost_driven_rtcost
+output = output.append(temp_cost)
+
+fig, ax = plt.subplots()
+output.T.plot(kind = 'bar', ax = ax)
+plt.show()
+
+x = np.linspace(train_errors[:,0].min(), train_errors[:,1].max(), 2000)
+
+plt.scatter(train_errors[:,0], train_errors[:,1])
+y = [(h_cost[i] - H_cost[i,0]*x)/H_cost[i,1] for i in range(robust_opf_model.num_constr)]
+for i in range(robust_opf_model.num_constr):
+    plt.plot(x, y[i], color = 'black')
+plt.ylim([-2, 2])
+plt.show()
+
 
 #%%
 H_tensor = nn.Parameter(torch.FloatTensor(H_bound).requires_grad_())

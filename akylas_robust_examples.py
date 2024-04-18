@@ -616,6 +616,63 @@ plt.show()
 # solve robust OPF
 dd_box_solutions = robust_dcopf_polyhedral(H_bound, h_bound, w_exp, grid, loss = 'cost', verbose = -1)
 
+#%% Scenario approach with redispatch 
+
+# Grid Parameters
+Pmax = grid['Pmax']
+C_r_up = grid['C_r_up']
+C_r_down = grid['C_r_down']
+Cost = grid['Cost']    
+
+node_G = grid['node_G']
+node_L = grid['node_L']
+node_W = grid['node_W']
+    
+PTDF = grid['PTDF']
+VOLL = grid['VOLL']
+VOWS = grid['VOWS']
+
+# number of robust constraints to be reformulated
+num_scen = len(box_vert)
+w_scenarios = np.array(box_vert).T
+w_expected = grid['w_exp']
+
+m = gp.Model()
+    
+### variables    
+# DA Variables
+p_G = m.addMVar((grid['n_unit']), vtype = gp.GRB.CONTINUOUS, lb = 0, name = 'p_G')
+r_up_G = m.addMVar((grid['n_unit']), vtype = gp.GRB.CONTINUOUS, lb = 0, name = 'upward reserve')
+r_down_G = m.addMVar((grid['n_unit']), vtype = gp.GRB.CONTINUOUS, lb = 0, name = 'downward reserve')
+
+rd_g = m.addMVar((grid['n_unit'], num_scen), vtype = gp.GRB.CONTINUOUS, lb = -gp.GRB.INFINITY, name = 'redispatch')
+
+f_margin_up = m.addMVar((grid['n_lines']), vtype = gp.GRB.CONTINUOUS, lb = 0, name = 'upward reserve')
+f_margin_down = m.addMVar((grid['n_lines']), vtype = gp.GRB.CONTINUOUS, lb = 0, name = 'downward reserve')    
+
+### DA constraints 
+m.addConstr( p_G + r_up_G <= Pmax.reshape(-1))
+m.addConstr( p_G - r_down_G >= 0)
+m.addConstr( p_G.sum() + w_expected.sum() == grid['Pd'].sum())
+
+
+m.addConstr(grid['Line_Capacity'].reshape(-1) - f_margin_up == PTDF@(node_G@p_G + node_W@w_expected - node_L@grid['Pd'] ) )
+m.addConstr(grid['Line_Capacity'].reshape(-1) - f_margin_down == -PTDF@(node_G@p_G + node_W@w_expected - node_L@grid['Pd'] ) )
+
+### scenario constraints 
+
+# system balancing constraints over all scenarios
+m.addConstrs( w_scenarios[:,s].sum() + rd_g[:,s].sum() == 0 for s in range(num_scen))
+
+m.addConstrs( rd_g[:,s] <= r_up_G for s in range(num_scen))
+m.addConstrs( -rd_g[:,s] <= r_down_G for s in range(num_scen))
+        
+m.addConstrs( PTDF@(node_G@(rd_g[:,s]) + node_W@w_scenarios[:,s]) <= f_margin_up for s in range(num_scen))
+m.addConstrs( -PTDF@(node_G@(rd_g[:,s]) + node_W@w_scenarios[:,s]) <= f_margin_down for s in range(num_scen))
+                               
+m.setObjective( Cost@p_G + C_r_up@r_up_G + C_r_down@r_down_G, gp.GRB.MINIMIZE)             
+m.optimize()
+
 #%% Box uncertainty with budget/ dual norm
 
 # !!!! need to fix something on the flow constraints to make it equivalent to the above formulation
@@ -706,7 +763,7 @@ patches.append(box)
 ax.add_patch(box)
 
 # polyhedron
-x = np.linspace(train_errors[:,0].min(), train_errors[:,1].max(), 2000)
+x = np.linspace(-1, 1, 2000)
 y = [(h_poly[i] - H_poly[i,0]*x)/H_poly[i,1] for i in range(len(H_poly))]
 
 for i in range(len(H_poly)):
@@ -717,7 +774,7 @@ for i in range(len(H_poly)):
         
 plt.ylim([-2, 2])
 plt.xlim([-2, 2])
-plt.legend()
+plt.legend(fontsize = 12, ncol = 3)
 plt.show()
 
 #%%
@@ -780,11 +837,11 @@ h_cost = robust_opf_model.h.detach().numpy()
 dd_cost_poly_solutions = robust_dcopf_polyhedral(H_cost, h_cost, w_exp, grid, verbose = -1)
 
 temp_cost = pd.DataFrame(data = [], columns = ['DA_cost', 'RT_cost'], index = ['CostDriven_poly'])
-cost_driven_rtcost = oos_cost_estimation(test_errors, dd_cost_poly_solutions, grid, c_viol = 2*1e2)
+cost_driven_rtcost = oos_cost_estimation(test_errors, dd_cost_poly_solutions, grid, c_viol = c_viol)
 
 temp_cost.loc['CostDriven_poly']['DA_cost'] = dd_cost_poly_solutions['da_cost']
 temp_cost.loc['CostDriven_poly']['RT_cost'] = cost_driven_rtcost
-output = output.append(temp_cost)
+output = pd.concat([output, temp_cost])
 
 # Plot everything
 fig, ax = plt.subplots(figsize = (6,4))
@@ -813,7 +870,7 @@ patches.append(box)
 ax.add_patch(box)
 
 # polyhedron
-x = np.linspace(train_errors[:,0].min(), train_errors[:,1].max(), 2000)
+x = np.linspace(-1.5, 1.5, 2000)
 y = [(h_poly[i] - H_poly[i,0]*x)/H_poly[i,1] for i in range(len(H_poly))]
 
 for i in range(len(H_poly)):
@@ -833,7 +890,7 @@ for i in range(robust_opf_model.num_constr):
     
 plt.ylim([-2, 2])
 plt.xlim([-2, 2])
-plt.legend(fontsize = 10, ncol = )
+plt.legend(fontsize = 10, ncol = 4)
 plt.show()
 
 

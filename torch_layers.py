@@ -586,7 +586,7 @@ class Robust_OPF(nn.Module):
             return self.model(x).detach().numpy()
 class Scenario_Robust_OPF(nn.Module):        
     
-    def __init__(self, num_uncertainties, num_scen, initial_scenarios, grid, c_viol = 2*1e4, regularization = 0, include_network = True, 
+    def __init__(self, num_uncertainties, num_scen, initial_scenarios, support, grid, c_viol = 2*1e4, regularization = 0, include_network = True, 
                  add_fixed_box = True):
         super(Scenario_Robust_OPF, self).__init__()
         
@@ -603,6 +603,8 @@ class Scenario_Robust_OPF(nn.Module):
         VOLL = grid['VOLL']
         VOWS = grid['VOWS']
         
+        self.support_UB = torch.FloatTensor(support[0]) # num_uncertainties * 2
+        self.support_LB = torch.FloatTensor(support[1]) # num_uncertainties * 2
         self.Pmax = torch.FloatTensor(Pmax)
         self.Pmin = torch.FloatTensor(np.zeros(grid['n_unit']))
         self.Cost = torch.FloatTensor(Cost)
@@ -625,7 +627,13 @@ class Scenario_Robust_OPF(nn.Module):
         
         # Parameters to be estimated (initialize at the extremes of the box)
         self.w_scenarios_param = nn.Parameter(torch.FloatTensor(initial_scenarios).requires_grad_())
-                
+        
+        # project to feasible set        
+        w_proj = torch.maximum(torch.minimum( self.w_scenarios_param, self.support_UB), self.support_LB)
+        # update parameter values
+        with torch.no_grad():
+            self.w_scenarios_param.copy_(w_proj)
+                    
         self.grid = grid
         self.regularization = regularization
         self.include_network = include_network
@@ -690,27 +698,31 @@ class Scenario_Robust_OPF(nn.Module):
 
         recourse_up = cp.Variable((grid['n_unit']), nonneg = True)
         recourse_down = cp.Variable((grid['n_unit']), nonneg = True)
-        g_shed = cp.Variable(grid['n_unit'], nonneg = True)
-        l_shed = cp.Variable(grid['n_loads'], nonneg = True)
+        
+        slack_up = cp.Variable(grid['n_nodes'], nonneg = True)
+        slack_down = cp.Variable(grid['n_nodes'], nonneg = True)
+        
+        #l_shed = cp.Variable(grid['n_loads'], nonneg = True)
+        
         cost_RT = cp.Variable(1, nonneg = True)
         
         RT_sched_constraints = []
 
         RT_sched_constraints += [recourse_up <= r_up_param]            
         RT_sched_constraints += [recourse_down <= r_down_param]            
-        RT_sched_constraints += [PTDF@(node_G@(recourse_up - recourse_down - g_shed) + node_L@(l_shed) + node_W@(w_realized_error)) <= f_margin_up_param]            
-        RT_sched_constraints += [-PTDF@(node_G@(recourse_up - recourse_down - g_shed) + node_L@(l_shed) + node_W@(w_realized_error)) <= f_margin_down_param]            
+        RT_sched_constraints += [PTDF@(node_G@(recourse_up - recourse_down) + (slack_up -  slack_down) + node_W@(w_realized_error)) <= f_margin_up_param]            
+        RT_sched_constraints += [-PTDF@(node_G@(recourse_up - recourse_down) + (slack_up -  slack_down) + node_W@(w_realized_error)) <= f_margin_down_param]            
         #RT_sched_constraints += [-PTDF@(node_G@(p_g_param + recourse_up - recourse_down - g_shed) + node_L@(l_shed-grid['Pd']) + node_W@(grid['w_exp'] + w_realized_error)) <= grid['Line_Capacity'].reshape(-1)]            
                 
         # balancing
-        RT_sched_constraints += [ recourse_up.sum() - recourse_down.sum() -g_shed.sum() + w_realized_error.sum() + l_shed.sum() == 0]
-        RT_sched_constraints += [cost_RT == self.c_viol*(g_shed.sum() + l_shed.sum()) ]
+        RT_sched_constraints += [ recourse_up.sum() - recourse_down.sum() + w_realized_error.sum() + (slack_up -  slack_down).sum() == 0]
+        RT_sched_constraints += [cost_RT == self.c_viol*(slack_up.sum() + slack_down.sum()) ]
             
         objective_funct = cp.Minimize( cost_RT ) 
         rt_problem = cp.Problem(objective_funct, RT_sched_constraints)
          
         self.rt_layer = CvxpyLayer(rt_problem, parameters=[r_up_param, r_down_param, f_margin_up_param, f_margin_down_param, w_realized_error],
-                                           variables = [recourse_up, recourse_down, g_shed, l_shed, cost_RT] )
+                                           variables = [recourse_up, recourse_down, slack_up, slack_down, cost_RT] )
 
 
     def forward(self, w_scen):
@@ -849,6 +861,12 @@ class Scenario_Robust_OPF(nn.Module):
                 loss.backward()
                 optimizer.step()
                 
+                # Project back to box of support 
+                w_proj = torch.maximum(torch.minimum( self.w_scenarios_param, self.support_UB), self.support_LB)
+                # update parameter values
+                with torch.no_grad():
+                    self.w_scenarios_param.copy_(w_proj)
+                    
                 running_loss += loss.item()
                 
                 

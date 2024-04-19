@@ -2,6 +2,8 @@
 """
 Learning prescriptive scenarios/ deterministic formulation with recourse dispatch 
 
+Conditional to other features/ parameters/ contextual information
+
 @author: a.stratigakos
 """
 
@@ -35,38 +37,6 @@ plt.rcParams['font.size'] = 7
 plt.rcParams['font.family'] = 'serif'
 plt.rcParams['font.serif'] = 'Times New Roman'
 plt.rcParams["mathtext.fontset"] = 'dejavuserif'
-
-
-def oos_cost_estimation(realizations, sol_dict, grid, c_viol = 2*1e3):
-    
-    recourse_actions = -(sol_dict['A']@realizations.T).T
-    
-
-    # exceeding reserves
-    aggr_rup_violations = np.maximum( recourse_actions - sol_dict['r_up'], 0).sum()
-    aggr_rdown_violations = np.maximum( -recourse_actions - sol_dict['r_down'], 0).sum()
-                             
-                                                                                 
-    # exceeding line rating
-    rt_injections = (grid['PTDF']@(grid['node_G']@recourse_actions.T + grid['node_W']@realizations.T)).T
-    
-    aggr_f_margin_up_violations = np.maximum( rt_injections - sol_dict['f_margin_up'], 0).sum()
-    aggr_f_margin_down_violations = np.maximum( -rt_injections - sol_dict['f_margin_down'], 0).sum()
-    
-    print('Times of violations')    
-    print('Upward reserve margin:', ((recourse_actions - sol_dict['r_up'])>0).sum() )
-    print('Downward reserve margin:', ((recourse_actions - sol_dict['r_down'])>0).sum() )
-    print('Upward line capacity margin:', ((rt_injections - sol_dict['f_margin_up'])>0).sum() )
-    print('Downward line capacity margin:', ((-rt_injections - sol_dict['f_margin_down'])>0).sum() )
-
-    print('Max exceedence')    
-    print('Upward reserve margin:',  np.maximum( recourse_actions - sol_dict['r_up'], 0).max() )
-    print('Downward reserve margin:', np.maximum( -recourse_actions - sol_dict['r_down'], 0).max() )
-    print('Upward line capacity margin:', np.maximum( rt_injections - sol_dict['f_margin_up'], 0).max() )
-    print('Downward line capacity margin:', np.maximum( -rt_injections - sol_dict['f_margin_down'], 0).max() )
-    
-    rt_cost = c_viol*(aggr_rup_violations + aggr_rdown_violations + aggr_f_margin_up_violations + aggr_f_margin_down_violations)
-    return(rt_cost)
 
 ###### RT market layer
 
@@ -601,6 +571,48 @@ def robust_dcopf_box(UB, LB, H, h, w_expected, grid, network = True, slack_var =
         # scale cost back to aggregate    
         return 1e10, [], []
 
+def create_conditional_errors(N, capacity, expected, distr = 'normal', plot = True, std = 0.25, seed = 0):
+    m = len(capacity)
+    errors = np.zeros((N, m))
+
+    # error = actual - expected
+    # max positive error: capacity - expected
+    # min negative error: -expected
+        
+    if distr == 'normal':
+        # multivariate normal
+        std_Pd = std*expected      
+        ub_Pd = capacity
+        lb_Pd = np.zeros(m)
+        
+        mean_Pd = ((ub_Pd-lb_Pd)/2+lb_Pd).reshape(-1)
+        
+        # generate correlation matrix *must be symmetric    
+        np.random.seed(0)
+        a = np.random.rand(m, m)        
+        R = np.tril(a) + np.tril(a, -1).T
+        for i in range(grid['n_wind']): 
+            R[i,i] = 1
+        # estimate covariance matrix
+        S_cov = np.diag(std_Pd)@R@np.diag(std_Pd)        
+        # sample demands, project them into support
+        np.random.seed(seed)
+        samples = np.random.multivariate_normal(np.zeros(mean_Pd.shape[0]), S_cov, size = N_samples).round(2)
+        errors = samples
+
+    # Project back to feasible set
+    for u in range(m):
+        # upper bound/ positive errors == actual - exp >=0
+        errors[:,u][errors[:,u] > capacity[u] - expected[u]] = capacity[u] - expected[u]
+        #lower bound/ negative error == actual - exp <= 0
+        errors[:,u][errors[:,u] < -expected[u]] = -expected[u]
+        
+    # error scatterplot
+    if plot:
+        plt.scatter(errors[:,0], errors[:,1])
+        plt.show()
+    return errors
+
 def create_wind_errors(N, capacity, expected, distr = 'normal', plot = True, std = 0.25, seed = 0):
     m = len(capacity)
     errors = np.zeros((N, m))
@@ -709,19 +721,59 @@ for u, bus in enumerate(windloc):
 
 grid['node_L'] = np.eye((grid['n_nodes']))
 #%%
-# create a large set of forecast errors from different wind scenarios
-
-N_samples = 2000
 c_viol = 1e4
-train_errors = create_wind_errors(N_samples, grid['w_cap'], grid['w_exp'], distr = 'normal', plot = True, std = 0.25, seed = 0)
+n_wind = len(grid['w_exp'])
+# Create samples of demand + wind + sample of forecast errors (e.g., sampling probabilistic distribution)
+N_samples = 4000
 
+demand_samples = np.random.uniform(0.5, 1.1, size = (N_samples, len(grid['Pd'])))*grid['Pd']
+# expected values
+wind_samples = np.random.uniform(0.5, 1.1, size = (N_samples, len(grid['w_exp'])))*grid['w_exp']
 
-# Upper and lower bounds for errors
+corr = 0.5
+wind_error = []
+quantiles = [0.025, 0.975]
 
-UB = grid['w_cap'] - grid['w_exp']
-LB = - grid['w_exp']
+cond_UB = []
+cond_LB = []
 
-#%% 
+for i in range(N_samples):
+    # conditional variance
+    cond_S_cov = np.array([[(0.15*wind_samples[i,0])**2, 0.15**2*(corr*wind_samples[i,0]*wind_samples[i,1])], 
+                  [0.15**2*(corr*wind_samples[i,0]*wind_samples[i,1]), (0.15*wind_samples[i,1])**2 ] ])
+
+    # sample demands, project them into support
+    np.random.seed(1234)
+    samples = np.random.multivariate_normal(np.zeros(n_wind), cond_S_cov, 1000)
+    
+    temp_LB, temp_UB = np.quantile(samples, quantiles, 0)
+    
+    # prediction intervals, we assumed are produced from probabilistic forecasts
+    cond_UB.append(temp_UB)
+    cond_LB.append(temp_LB)
+    
+    # realized errors (used for testing)
+    wind_error.append(samples[0].reshape(-1))
+    
+wind_error = np.array(wind_error)    
+cond_UB = np.array(cond_UB)
+cond_LB = np.array(cond_LB)
+
+# project to the support
+wind_error = np.maximum(np.minimum(wind_error, grid['w_cap'] - wind_samples), - wind_samples)
+
+train_wind_error = wind_error[:2000]
+test_wind_error = wind_error[2000:]
+
+train_demand_samples = demand_samples[:2000]
+test_demand_samples = demand_samples[2000:]
+
+train_wind_samples = wind_samples[:2000]
+test_wind_samples = wind_samples[2000:]
+
+#%%
+#next steps: i) conditional robust solution, ii) adaptive cost-driven model (learning the mapping parameters)
+#%% Conditional box intervals??? they should vary as a function of the probabilistic forecast
 
 # Data-driven uncertainty box
 H_bound = []

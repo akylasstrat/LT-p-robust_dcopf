@@ -584,6 +584,7 @@ class Robust_OPF(nn.Module):
         'Forecast combination weights, inference only'
         with torch.no_grad():            
             return self.model(x).detach().numpy()
+        
 class Scenario_Robust_OPF(nn.Module):        
     
     def __init__(self, num_uncertainties, num_scen, initial_scenarios, support, grid, c_viol = 2*1e4, regularization = 0, include_network = True, 
@@ -942,6 +943,519 @@ class Scenario_Robust_OPF(nn.Module):
         return average_loss
     
 
+class Contextual_Scenario_Robust_OPF(nn.Module):        
+    
+    def __init__(self, mlp_param_dict, num_uncertainties, num_scen, grid, initial_scenarios, c_viol = 2*1e4, 
+                 activation = nn.ReLU(), include_network = True, add_fixed_box = True):
+        super(Contextual_Scenario_Robust_OPF, self).__init__()
+                
+        #self.support_UB = torch.FloatTensor(support[0]) # num_uncertainties * 2
+        #self.support_LB = torch.FloatTensor(support[1]) # num_uncertainties * 2
+        self.Pmax = torch.FloatTensor(grid['Pmax'])
+        self.Pmin = torch.FloatTensor(np.zeros(grid['n_unit']))
+        self.Cost = torch.FloatTensor(grid['Cost'])
+        self.C_r_up = torch.FloatTensor(grid['C_r_up'])
+        self.C_r_down = torch.FloatTensor(grid['C_r_down'])
+        self.node_G = torch.FloatTensor(grid['node_G'])
+        self.node_L = torch.FloatTensor(grid['node_L'])
+        self.node_W = torch.FloatTensor(grid['node_W'])
+        self.PTDF = torch.FloatTensor(grid['PTDF'])
+        self.w_cap = torch.FloatTensor(grid['w_cap'])
+        self.c_viol = c_viol        
+        self.grid = grid
+        self.include_network = include_network
+        
+        ### Intialize polytope defined by scenarios
+        self.num_uncertainties = num_uncertainties # number of uncertain parameters (only winds here)
+        self.num_constr = num_scen # number of scenarios to learn
+        
+        # Parameters to be estimated (initialize at the extremes of the box)
+        self.w_scenarios_param = nn.Parameter(torch.FloatTensor(initial_scenarios).requires_grad_())
+        
+        
+        # projection step (set as separate function)        
+        #w_proj = torch.maximum(torch.minimum( self.w_scenarios_param, self.support_UB), self.support_LB)
+        # update parameter values
+        #with torch.no_grad():
+        #    self.w_scenarios_param.copy_(w_proj)
+        
+        ### Initialize MLP layer
+        input_size = mlp_param_dict['input_size']
+        hidden_sizes = mlp_param_dict['hidden_sizes']
+        output_size = num_uncertainties*num_scen
+        
+        # create sequential MLP model to predict combination weights
+        #!!! *** To avoid outputting a matrix, create a model for each scenario ***
+        
+        layer_sizes = [input_size] + hidden_sizes + [output_size]
+        layers = []
+        for i in range(len(layer_sizes) - 1):
+            layers.append(nn.Linear(layer_sizes[i], layer_sizes[i + 1]))
+            if i < len(layer_sizes) - 2:
+                layers.append(activation)
+
+        self.model = nn.Sequential(*layers)
+        
+        #### Robust DCOPF Layer
+        # Parameters: nominal wind production, nominal demand (expected values), scenarios for errors
+        w_nominal = cp.Parameter((grid['n_wind']), nonneg = True)
+        d_nominal = cp.Parameter((grid['n_loads']), nonneg = True)
+        
+        w_error_scen = cp.Parameter((num_scen, num_uncertainties))
+        
+        ###### DA variables and linear decision rules
+        
+        ### variables    
+        # DA Variables
+                        
+        #flow_da = m.addMVar((grid['n_lines']), vtype = gp.GRB.CONTINUOUS, lb = -gp.GRB.INFINITY)    
+        p_G = cp.Variable((grid['n_unit']), nonneg = True)
+        r_up_G = cp.Variable((grid['n_unit']), nonneg = True)
+        r_down_G = cp.Variable((grid['n_unit']), nonneg = True)
+        slack = cp.Variable((grid['n_nodes']), nonneg = True)
+        
+        p_rt_up = cp.Variable((grid['n_unit'], num_scen), nonneg = True)
+        p_rt_down = cp.Variable((grid['n_unit'], num_scen), nonneg = True)
+
+        f_margin_up = cp.Variable((grid['n_lines']), nonneg = True)
+        f_margin_down = cp.Variable((grid['n_lines']), nonneg = True)
+
+        #### DA constraints
+        
+        ### DA constraints 
+        DA_constraints = [p_G + r_up_G<= self.Pmax.reshape(-1), p_G - r_down_G >= 0, 
+                          p_G.sum() + w_nominal.sum() == d_nominal.sum(), 
+                          grid['Line_Capacity'].reshape(-1) - f_margin_up == self.PTDF@(self.node_G@p_G + self.node_W@w_nominal - self.node_L@d_nominal),
+                          grid['Line_Capacity'].reshape(-1) - f_margin_down == -self.PTDF@(self.node_G@p_G + self.node_W@w_nominal - self.node_L@d_nominal ),]         
+
+        ##### Robust constraints per scenario
+        
+        # Reformulation of robust constraints
+        # downward reserve bound/ each row are the duals to reformulate each constraints
+        Robust_constr = [ p_rt_up[:,s] <= r_up_G for s in range(num_scen)] \
+                        + [p_rt_down[:,s] <= r_down_G for s in range(num_scen)]\
+                        + [p_rt_up[:,s].sum() - p_rt_down[:,s].sum() + slack.sum() + w_error_scen[s].sum() == 0 for s in range(num_scen)]\
+                        + [self.PTDF@(self.node_G@(p_rt_up[:,s] - p_rt_down[:,s]) + slack + self.node_W@w_error_scen[s]) <= f_margin_up for s in range(num_scen)]\
+                        + [-self.PTDF@(self.node_G@(p_rt_up[:,s] - p_rt_down[:,s]) + slack + self.node_W@w_error_scen[s]) <= f_margin_down for s in range(num_scen)]\
+        
+
+        DA_cost_expr = self.Cost@p_G + self.C_r_up@r_up_G + self.C_r_down@r_down_G + self.c_viol*cp.abs(slack).sum()
+        objective_funct = cp.Minimize( DA_cost_expr ) 
+                
+        robust_opf_problem = cp.Problem(objective_funct, DA_constraints + Robust_constr)
+         
+        self.robust_opf_layer = CvxpyLayer(robust_opf_problem, parameters=[d_nominal, w_nominal, w_error_scen],
+                                           variables = [p_G, r_up_G, r_down_G, p_rt_up, p_rt_down, f_margin_up, f_margin_down])
+                                        
+        
+        ###### RT market layer
+        #p_g_param = cp.Parameter(grid['n_unit'], nonneg = True)
+        r_up_param = cp.Parameter(grid['n_unit'], nonneg = True)
+        r_down_param = cp.Parameter(grid['n_unit'], nonneg = True)
+        f_margin_up_param = cp.Parameter(grid['n_lines'], nonneg = True)
+        f_margin_down_param = cp.Parameter(grid['n_lines'], nonneg = True)
+        w_realized_error = cp.Parameter(num_uncertainties)
+
+        recourse_up = cp.Variable((grid['n_unit']), nonneg = True)
+        recourse_down = cp.Variable((grid['n_unit']), nonneg = True)
+        
+        slack_up = cp.Variable(grid['n_nodes'], nonneg = True)
+        slack_down = cp.Variable(grid['n_nodes'], nonneg = True)
+        
+        #l_shed = cp.Variable(grid['n_loads'], nonneg = True)
+        
+        cost_RT = cp.Variable(1, nonneg = True)
+        
+        RT_sched_constraints = []
+
+        RT_sched_constraints += [recourse_up <= r_up_param]            
+        RT_sched_constraints += [recourse_down <= r_down_param]            
+        RT_sched_constraints += [self.PTDF@(self.node_G@(recourse_up - recourse_down) + (slack_up -  slack_down) + self.node_W@(w_realized_error)) <= f_margin_up_param]            
+        RT_sched_constraints += [-self.PTDF@(self.node_G@(recourse_up - recourse_down) + (slack_up -  slack_down) + self.node_W@(w_realized_error)) <= f_margin_down_param]            
+                
+        # balancing
+        RT_sched_constraints += [ recourse_up.sum() - recourse_down.sum() + w_realized_error.sum() + (slack_up -  slack_down).sum() == 0]
+        RT_sched_constraints += [cost_RT == self.c_viol*(slack_up.sum() + slack_down.sum()) ]
+            
+        objective_funct = cp.Minimize( cost_RT ) 
+        rt_problem = cp.Problem(objective_funct, RT_sched_constraints)
+         
+        self.rt_layer = CvxpyLayer(rt_problem, parameters=[r_up_param, r_down_param, f_margin_up_param, f_margin_down_param, w_realized_error],
+                                           variables = [recourse_up, recourse_down, slack_up, slack_down, cost_RT] )
+
+
+    def scenario_projection(self, w_nominal, w_error_scen):
+        """
+        Projects scenarios to box constraints defined by support
+            Support depends on problem parameterization (e.g., expected wind production)
+        """            
+        temp_UB = self.w_cap - w_nominal
+        temp_LB = - w_nominal
+        
+        w_proj = w_error_scen
+        
+        #print(torch.maximum(torch.minimum( w_error_scen[:,0,:], temp_UB), temp_LB).shape)
+        for j in range(self.num_constr):
+            with torch.no_grad():
+                w_proj[:,j,:] = torch.maximum(torch.minimum( w_error_scen[:,j,:], temp_UB), temp_LB)
+        
+        # update parameter values
+        #with torch.no_grad():
+        #    self.w_scenarios_param.copy_(w_proj)
+        return  w_proj  
+    
+    def forward(self, demand_batch, wind_batch):
+        """
+        Forward pass of the newvendor layer.
+
+        Args:
+            list_inputs: A list of of input tensors/ PDFs.
+
+        Returns:
+            torch.Tensor: The convex combination of input tensors/ combination of PDFs.
+        """
+        
+        # predict the scenarios based on realization of features
+        #demand_batch = list_batch[0]
+        #wind_batch = list_batch[1]
+        #wind_error_batch = list_batch[2]
+        batch_size = len(demand_batch)
+        feat_hat = torch.cat([demand_batch, wind_batch], axis = 1)
+        
+        #w_scen_hat = torch.FloatTensor(np.array([self.model_scen[i](feat_hat) for i in range(self.num_constr)]))
+        
+        # !!!! Check that it transpoes everything correct
+        w_scen_hat = self.model(feat_hat).reshape(batch_size, self.num_constr, self.num_uncertainties)
+        #standard_output = self.model(feat_hat)
+        
+        # project back to feasible set
+        w_scen_hat_proj = self.scenario_projection(wind_batch, w_scen_hat)
+        
+        # Pass the combined output to the CVXPY layer
+        cvxpy_output = self.robust_opf_layer(demand_batch, wind_batch, w_scen_hat_proj, solver_args={'max_iters':500_000})
+
+        return cvxpy_output
+    
+    def predict(self, demand_batch, wind_batch):
+        """
+        Predicts the robust scenarios
+        """
+        
+        # predict the scenarios based on realization of features
+        batch_size = len(demand_batch)
+        feat_hat = torch.cat([demand_batch, wind_batch], axis = 1)
+                
+        # !!!! Check that it transpoes everything correct
+        with torch.no_grad():
+            w_scen_hat = self.model(feat_hat).reshape(batch_size, self.num_constr, self.num_uncertainties)
+            #standard_output = self.model(feat_hat)
+            
+            # project back to feasible set
+            w_scen_hat_proj = self.scenario_projection(wind_batch, w_scen_hat)
+
+        return w_scen_hat_proj
+    
+    def train_model(self, train_loader, val_loader, optimizer, epochs = 20, patience=5, projection = True, validation = False, 
+                    relative_tolerance = 0):
+                
+        #L_t = []
+        best_train_loss = 1e7
+        best_val_loss = 1e7 
+        early_stopping_counter = 0
+        best_weights = copy.deepcopy(self.state_dict())
+
+        Pmax_tensor = torch.FloatTensor(self.grid['Pmax'].reshape(-1))
+        Pmin_tensor = torch.FloatTensor(self.grid['Pmin'].reshape(-1))
+        
+        # estimate initial loss
+        print('Estimate Initial Loss...')
+        '''
+        initial_train_loss = 0
+        with torch.no_grad():
+            for batch_data in train_loader:
+                y_batch = batch_data[-1]
+                # clear gradients
+                optimizer.zero_grad()
+                output_hat = self.forward(batch_data[:-1])
+                
+                pdf_comb_hat = output_hat[0]
+                cdf_comb_hat = pdf_comb_hat.cumsum(1)
+                
+                decisions_hat = output_hat[1][0]                
+                p_hat = decisions_hat[0]
+                
+                # Project p_hat to feasible set
+                p_hat_proj = torch.maximum(torch.minimum(p_hat, Pmax_tensor), Pmin_tensor)
+                cost_DA_hat = decisions_hat[-1]
+
+                # solve RT layer, find redispatch cost                
+                rt_output = self.rt_layer(p_hat_proj, y_batch.reshape(-1,1), solver_args={'max_iters':50_000})                
+                # CRPS of combination
+                crps_i = sum([torch.square( cdf_comb_hat[i] - 1*(self.support >= y_batch[i]) ).sum() for i in range(len(y_batch))])
+                loss = cost_DA_hat.mean() + rt_output[-1].mean() + self.gamma*crps_i
+ 
+                initial_train_loss += loss.item()
+                
+        initial_train_loss = initial_train_loss/len(train_loader)
+        best_train_loss = initial_train_loss
+        print(f'Initial Estimate: {best_train_loss}')
+        '''                
+        for epoch in range(epochs):
+            # activate train functionality
+            self.train()
+            running_loss = 0.0                
+            
+
+            # sample batch data
+            for batch_iter, batch_data in enumerate(train_loader):
+
+                d_hat = batch_data[0]
+                w_hat = batch_data[1]
+                w_error_hat = batch_data[2]
+                
+                # clear gradients
+                optimizer.zero_grad()
+
+                # Forward pass: solve robust OPF
+                #start = time.time()
+                #start = time.time()
+                
+                
+                # Forward pass: map contextual information to scenarios, solve robust problem
+                decisions_hat = self.forward(d_hat, w_hat)
+                
+                # visualize some scenarios
+                '''
+                if ((epoch)%5 == 0) and (batch_iter == 0):
+                                    
+                    fig, ax = plt.subplots(figsize = (6,4))                
+                    w_scen = to_np(self.w_scenarios_param)
+                    #plt.scatter(y_batch[:,0], y_batch[:,1], label = 'Data')                    
+                    # Cost-driven convex hull
+                    hull = ConvexHull(w_scen)
+                    plt.plot(w_scen[:,0], w_scen[:,1], 's', color = 'tab:red', label = 'Scenarios')
+                    for j, simplex in enumerate(hull.simplices):
+                        if j == 0:
+                            plt.plot(w_scen[simplex, 0], w_scen[simplex, 1], color = 'tab:red', linestyle = '--', lw = 2, label = 'Convex Hull')    
+                        else:
+                            plt.plot(w_scen[simplex, 0], w_scen[simplex, 1], color = 'tab:red', linestyle = '--', lw = 2)    
+                    plt.ylim([-2, 2])
+                    plt.xlim([-2, 2])
+                    plt.title(f'C_viol = {self.c_viol} \$/MWh, Iteration: {epoch}', fontsize = 12)
+                    plt.xlabel('Error 1')
+                    plt.xlabel('Error 2')
+                    plt.legend(fontsize = 12, loc = 'upper right')
+                    plt.show()
+                '''
+                
+                p_hat = decisions_hat[0]
+                r_up_hat = decisions_hat[1]
+                r_down_hat = decisions_hat[2]
+                f_margin_up_hat = decisions_hat[5]
+                f_margin_down_hat = decisions_hat[6]
+                
+                # Project to feasible set (might incur numerical errors)
+                p_hat_proj = torch.maximum(torch.minimum(p_hat, self.Pmax), self.Pmin)
+                r_up_hat_proj = torch.maximum(torch.minimum(r_up_hat, self.Pmax - p_hat_proj), torch.zeros(self.grid['n_unit']))
+                r_down_hat_proj = torch.maximum(torch.minimum(r_down_hat, p_hat_proj), torch.zeros(self.grid['n_unit']))
+                
+                f_margin_up_hat_proj = torch.maximum(f_margin_up_hat, torch.zeros(self.grid['n_lines']) ) 
+                f_margin_down_hat_proj = torch.maximum(f_margin_down_hat, torch.zeros(self.grid['n_lines']) ) 
+                
+                # Evaluate cost-driven error
+                # DA cost                
+                
+                cost_DA_hat = p_hat@self.Cost + r_up_hat@self.C_r_up + r_down_hat@self.C_r_down
+
+                # RT dispatch cost (penalize violations)
+                rt_output = self.rt_layer(r_up_hat_proj, r_down_hat_proj, f_margin_up_hat_proj, f_margin_down_hat_proj, 
+                                          w_error_hat, solver_args={'max_iters':500_000})                
+                cost_RT_hat = rt_output[-1]
+                
+                loss = cost_DA_hat.mean() + cost_RT_hat.mean()
+                    
+                # backward pass
+                # forward pass: combine forecasts and each stochastic ED problem
+                loss.backward()
+                optimizer.step()
+                
+                # Project back to box of support 
+                #w_proj = torch.maximum(torch.minimum( self.w_scenarios_param, self.support_UB), self.support_LB)
+                # update parameter values
+                #with torch.no_grad():
+                #    self.w_scenarios_param.copy_(w_proj)
+                    
+                running_loss += loss.item()
+                
+                
+            average_train_loss = running_loss / len(train_loader)
+                                        
+            if validation == True:
+                # evaluate performance on stand-out validation set
+                val_loss = self.evaluate(val_loader)
+                print(f"Epoch [{epoch + 1}/{epochs}] - Train Loss: {average_train_loss:.4f} - Val Loss: {val_loss:.4f}")
+                
+                if (val_loss < best_val_loss) and ( (best_val_loss-val_loss)/best_val_loss > relative_tolerance):
+                    best_val_loss = val_loss
+                    best_weights = copy.deepcopy(self.state_dict())
+                    early_stopping_counter = 0
+                else:
+                    early_stopping_counter += 1
+                    if early_stopping_counter >= patience:
+                        print("Early stopping triggered.")
+                        # recover best weights
+                        self.load_state_dict(best_weights)
+                        return
+            else:
+                # only evaluate on training data set
+                print(f"Epoch [{epoch + 1}/{epochs}] - Train Loss: {average_train_loss:.4f} ")
+    
+                if (average_train_loss < best_train_loss) and ( (best_train_loss-average_train_loss)/best_train_loss > relative_tolerance):
+                    best_train_loss = average_train_loss
+                    best_weights = copy.deepcopy(self.state_dict())
+                    early_stopping_counter = 0
+                    
+                else:
+                    early_stopping_counter += 1
+                    if early_stopping_counter >= patience:
+                        print("Early stopping triggered.")
+                        # recover best weights
+                        self.load_state_dict(best_weights)
+                        return
+        
+        print('Reached epoch limit.')
+        self.load_state_dict(best_weights)
+        return
+
+    def evaluate(self, data_loader):
+        # evaluate loss criterion/ used for estimating validation loss
+        self.eval()
+        total_loss = 0.0
+        with torch.no_grad():
+            for batch_data in data_loader:
+                y_batch = batch_data[-1]
+
+                # forward pass: combine forecasts and each stochastic ED problem
+                output_hat = self.forward(batch_data[:-1])
+
+                pdf_comb_hat = output_hat[0]
+                cdf_comb_hat = pdf_comb_hat.cumsum(1)
+                
+                decisions_hat = output_hat[1][0]
+                
+                p_hat = decisions_hat[0]
+                
+                # solve RT layer, find redispatch cost
+                rt_output = self.rt_layer(p_hat, y_batch.reshape(-1,1), solver_args={'max_iters':50000})                
+
+                # CRPS of combination
+                crps_i = sum([torch.square( cdf_comb_hat[i] - 1*(self.support >= y_batch[i]) ).sum() for i in range(len(y_batch))])
+
+                # total loss
+                loss = rt_output[-1].mean() + self.gamma*crps_i
+
+                total_loss += loss.item()
+                
+        average_loss = total_loss / len(data_loader)
+        return average_loss
+
+
+
+class DA_RobustScen_Clearing(nn.Module):        
+    'Solves DA market with robust constraints on a set of scenarios'
+    def __init__(self, grid, num_uncertainties, num_scen, c_viol = 2*1e4):
+        super(DA_RobustScen_Clearing, self).__init__()
+                
+        node_G = grid['node_G']
+        node_L = grid['node_L']
+        node_W = grid['node_W']            
+        PTDF = grid['PTDF']
+
+        self.Pmax = torch.FloatTensor(grid['Pmax'])
+        self.Pmin = torch.FloatTensor(np.zeros(grid['n_unit']))
+        self.Cost = torch.FloatTensor(grid['Cost'])
+        self.C_r_up = torch.FloatTensor(grid['C_r_up'])
+        self.C_r_down = torch.FloatTensor(grid['C_r_down'])
+        
+        self.c_viol = c_viol
+                
+        self.grid = grid
+        self.num_uncertainties = num_uncertainties                                                
+        
+        #### Robust DCOPF Layer
+        # Parameters: nominal wind production, nominal demand (expected values), scenarios for errors
+        w_nominal = cp.Parameter((grid['n_wind']), nonneg = True)
+        d_nominal = cp.Parameter((grid['n_loads']), nonneg = True)
+        
+        w_error_scen = cp.Parameter((num_scen, num_uncertainties))
+        
+        ###### DA variables and linear decision rules
+        
+        ### variables    
+        # DA Variables                        
+        p_G = cp.Variable((grid['n_unit']), nonneg = True)
+        r_up_G = cp.Variable((grid['n_unit']), nonneg = True)
+        r_down_G = cp.Variable((grid['n_unit']), nonneg = True)
+
+        f_margin_up = cp.Variable((grid['n_lines']), nonneg = True)
+        f_margin_down = cp.Variable((grid['n_lines']), nonneg = True)
+
+        # Recourse variables for scenarios        
+        p_rt_up = cp.Variable((grid['n_unit'], num_scen), nonneg = True)
+        p_rt_down = cp.Variable((grid['n_unit'], num_scen), nonneg = True)
+
+        #### DA constraints
+        
+        ### DA constraints 
+        DA_constraints = [p_G + r_up_G<= grid['Pmax'].reshape(-1), p_G - r_down_G >= 0, 
+                          p_G.sum() + w_nominal.sum() == d_nominal.sum(), 
+                          grid['Line_Capacity'].reshape(-1) - f_margin_up == PTDF@(node_G@p_G + node_W@w_nominal - node_L@d_nominal),
+                          grid['Line_Capacity'].reshape(-1) - f_margin_down == -PTDF@(node_G@p_G + node_W@w_nominal - node_L@d_nominal ),] 
+        
+
+        ##### Robust constraints per scenario
+        
+        # Reformulation of robust constraints
+        # downward reserve bound/ each row are the duals to reformulate each constraints
+        
+        Robust_constr = [ p_rt_up[:,s] <= r_up_G for s in range(num_scen)] \
+                        + [p_rt_down[:,s] <= r_down_G for s in range(num_scen)]\
+                        + [p_rt_up[:,s].sum() - p_rt_down[:,s].sum() + w_error_scen[s].sum() == 0 for s in range(num_scen)]\
+                        + [PTDF@(node_G@(p_rt_up[:,s] - p_rt_down[:,s]) + node_W@w_error_scen[s]) <= f_margin_up for s in range(num_scen)]\
+                        + [-PTDF@(node_G@(p_rt_up[:,s] - p_rt_down[:,s]) + node_W@w_error_scen[s]) <= f_margin_down for s in range(num_scen)]\
+        
+        DA_cost_expr = self.Cost@p_G + self.C_r_up@r_up_G + self.C_r_down@r_down_G
+        objective_funct = cp.Minimize( DA_cost_expr ) 
+                
+        robust_opf_problem = cp.Problem(objective_funct, DA_constraints + Robust_constr)
+         
+        self.robust_opf_layer = CvxpyLayer(robust_opf_problem, parameters=[d_nominal, w_nominal, w_error_scen],
+                                           variables = [p_G, r_up_G, r_down_G, p_rt_up, p_rt_down, f_margin_up, f_margin_down])
+        
+    def forward(self, d_hat, w_hat, w_error_scen_hat):
+        
+        da_solutions = {}
+        
+        d_nominal_tensor = torch.FloatTensor(d_hat)
+        w_hat_tensor = torch.FloatTensor(w_hat)
+        w_error_scen_hat = torch.FloatTensor(w_error_scen_hat)
+        
+        # solve DA market
+        da_output = self.robust_opf_layer(d_nominal_tensor, w_hat_tensor, w_error_scen_hat, solver_args={'max_iters':100_000})                
+        
+        
+        
+        da_solutions['p_da'] = to_np(da_output[0])
+        da_solutions['r_up'] = to_np(da_output[1])
+        da_solutions['r_down'] = to_np(da_output[2])
+        #da_solutions['p_recourse'] = to_np(da_output[3])
+        da_solutions['f_margin_up'] = to_np(da_output[5])
+        da_solutions['f_margin_down'] = to_np(da_output[6])
+        
+        da_solutions['da_cost'] = self.Cost@da_solutions['p_da'] + self.C_r_up@da_solutions['r_up'] + self.C_r_down@da_solutions['r_down']
+
+        return da_solutions
+    
 class RT_Clearing(nn.Module):        
     
     def __init__(self, grid, num_uncertainties, c_viol = 2*1e4):

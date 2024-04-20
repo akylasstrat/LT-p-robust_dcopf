@@ -725,6 +725,8 @@ c_viol = 1e4
 n_wind = len(grid['w_exp'])
 # Create samples of demand + wind + sample of forecast errors (e.g., sampling probabilistic distribution)
 N_samples = 4000
+N_train_samples = 2000
+N_test_samples = N_samples - N_train_samples
 
 demand_samples = np.random.uniform(0.5, 1.1, size = (N_samples, len(grid['Pd'])))*grid['Pd']
 # expected values
@@ -762,220 +764,114 @@ cond_LB = np.array(cond_LB)
 # project to the support
 wind_error = np.maximum(np.minimum(wind_error, grid['w_cap'] - wind_samples), - wind_samples)
 
-train_wind_error = wind_error[:2000]
-test_wind_error = wind_error[2000:]
+train_wind_error = wind_error[:N_train_samples]
+test_wind_error = wind_error[N_train_samples:]
 
-train_demand_samples = demand_samples[:2000]
-test_demand_samples = demand_samples[2000:]
+train_demand_samples = demand_samples[:N_train_samples]
+test_demand_samples = demand_samples[N_train_samples:]
 
-train_wind_samples = wind_samples[:2000]
-test_wind_samples = wind_samples[2000:]
+train_wind_samples = wind_samples[:N_train_samples]
+test_wind_samples = wind_samples[N_train_samples:]
 
-#%%
-#next steps: i) conditional robust solution, ii) adaptive cost-driven model (learning the mapping parameters)
-#%% Conditional box intervals??? they should vary as a function of the probabilistic forecast
-
-# Data-driven uncertainty box
-H_bound = []
-h_bound = []
-
-quantiles = [0.05, 0.95]
-
-h_lb = np.quantile(train_errors, quantiles[0], axis = 0).reshape(-1)
-h_ub = np.quantile(train_errors, quantiles[1], axis = 0).reshape(-1)
-
-#h_ub = np.array([1, 4])
-
-H_bound = np.row_stack((-np.eye(grid['n_wind']), np.eye(grid['n_wind'])))
-h_dd_box = np.row_stack((-h_lb, h_ub)).reshape(-1)
-
-h_bound = np.row_stack((-LB, UB)).reshape(-1)
-
-
-fig, ax = plt.subplots(figsize = (6,4))
-
-plt.scatter(train_errors[:,0], train_errors[:,1], alpha = 0.5)
-
-# data-driven box
-patches = []    
-dd_box_vert = [r for r in itertools.product([h_lb[0], h_ub[0]], 
-                                         [h_lb[1], h_ub[1]])]
-#%%
-dd_box_vert.insert(2, dd_box_vert[-1])
-dd_box_vert = dd_box_vert[:-1]
-
-dd_box = Polygon(np.array(dd_box_vert), fill = False, edgecolor = 'black', linewidth = 2, label = 'DD Box$_{98\%}$')
-patches.append(dd_box)
-ax.add_patch(dd_box)
-
-# full box
-patches = []    
-box_vert = [r for r in itertools.product([LB[0], UB[0]], [LB[1], UB[1]])]
-box_vert.insert(2, box_vert[-1])
-box_vert = box_vert[:-1]
-
-box = Polygon(np.array(box_vert), fill = False, 
-                  edgecolor = 'black', linestyle = '--', linewidth = 2, label = 'Full Box')
-patches.append(box)
-ax.add_patch(box)
-
-plt.ylim([-2, 2])
-plt.xlim([-2, 2])
-plt.legend(fontsize = 12, ncol = 2)
-plt.xlabel('Error 1')
-plt.ylabel('Error 2')
-plt.show()
-
-# solve robust OPF
-dd_box_solutions = robust_dcopf_polyhedral(H_bound, h_bound, w_exp, grid, loss = 'cost', verbose = -1)
-
-#tt = robust_dcopf_scenarios(np.array(dd_box_vert), w_expected, grid)
-
-#%% Robust with recourse and fixed number of scenarios
-w_scenarios = np.array(dd_box_vert)
-w_expected = grid['w_exp']
-
-# test different box intervals/ coverage
-alpha = [1, .95, .90]
-
-solution_dictionaries = {}
-
-print('Optimizing for differnt intervals')
-for a in np.array(alpha).round(2):
-    # find respective quantiles
-    if a == 1:        
-        quantiles = [1e-5, 1-1e-5]
-    else:
-        quantiles = [0 + (1-a)/2, 1 - (1-a)/2]
-    
-    print(f'Quantiles: {quantiles}')
-    
-    temp_h_lb = np.quantile(train_errors, quantiles[0], axis = 0).reshape(-1)
-    temp_h_ub = np.quantile(train_errors, quantiles[1], axis = 0).reshape(-1)
-    
-    temp_vertices = [r for r in itertools.product([temp_h_lb[0], temp_h_ub[0]], 
-                                                  [temp_h_lb[1], temp_h_ub[1]])]
-    temp_vertices = np.array(temp_vertices)
-    #temp_vertices.insert(2, temp_vertices[-1])
-    #temp_vertices = temp_vertices[:-1]
-    
-    
-    temp_box_scen_solution = robust_dcopf_scenarios(temp_vertices, w_expected, grid)
-    solution_dictionaries[f'Box_{int(100*a)}'] = temp_box_scen_solution
-
-
-#box_scen_solution = robust_dcopf_scenarios(w_scenarios, w_expected, grid)
-#box_scen_solution = robust_dcopf_scenarios(w_scenarios, w_expected, grid)
-#box_scen_solution = robust_dcopf_scenarios(w_scenarios, w_expected, grid)
-
-#%%
-
-UB_init = grid['w_cap'] - grid['w_exp'] - 1
-LB_init = - grid['w_exp'] + 1
+#%% Conditional robust solution: solve a robust problem at each day
 
 from torch_layers import *
 
-patience = 30
+da_clearing_layer = DA_RobustScen_Clearing(grid, 2, 4)
+
+box_robust_sol = []
+
+for i in range(N_test_samples):
+    if i%1000==0: print(f'Observation:{i}')
+    # create problem vertices from conditional intervals
+    conditional_vertices = [r for r in itertools.product([cond_LB[i,0], cond_UB[i,0]], 
+                                             [cond_LB[i,1], cond_UB[i,1]])]
+    
+    conditional_vertices = np.array(conditional_vertices)
+    
+    #temp_box_scen_solution = robust_dcopf_scenarios(conditional_vertices, train_wind_samples, grid)
+
+    temp_sol = da_clearing_layer(test_demand_samples[i], test_wind_samples[i], conditional_vertices)
+    
+    box_robust_sol.append(temp_sol)
+
+    
+#%% Learning contextual, cost-driven scenarios
+from torch_layers import *
+
+tensor_train_demand = torch.FloatTensor(train_demand_samples)
+tensor_train_wind = torch.FloatTensor(train_wind_samples)
+tensor_train_wind_error = torch.FloatTensor(train_wind_error)
+
+patience = 20
 batch_size = 2000
-num_epoch = 1000
+num_epoch = 200
 
-num_scen = 8
-w_scenarios = np.array(box_vert)
+num_scen = 4
 
-# support of uncertain parameters (used in projection step, avoid infeasibilities)
-# 2*number of uncertainties: first row is always Upper Bound
-support = np.vstack((UB, LB))
-w_expected = grid['w_exp']
+train_data_loader = create_data_loader([tensor_train_demand, tensor_train_wind, tensor_train_wind_error], batch_size = batch_size)
+valid_data_loader = create_data_loader([tensor_train_demand, tensor_train_wind, tensor_train_wind_error], batch_size = batch_size)
+
 num_uncertainties = len(grid['w_exp'])
 
-w_scenarios = np.random.normal(loc = 0, scale = 0.5, size = (num_scen, num_uncertainties))
+mlp_param = {}
+mlp_param['input_size'] = grid['n_loads'] + grid['n_wind']
+mlp_param['hidden_sizes'] = []
 
-tensor_trainY = torch.FloatTensor(train_errors)
+w_init_error_scen = np.random.normal(loc = 0, scale = 0.5, size = (num_scen, num_uncertainties))
 
-train_data_loader = create_data_loader([tensor_trainY], batch_size = batch_size)
-valid_data_loader = create_data_loader([tensor_trainY], batch_size = batch_size)
+contextual_robust_opf_model = Contextual_Scenario_Robust_OPF(mlp_param, num_uncertainties, num_scen, grid, w_init_error_scen, c_viol = c_viol)
+optimizer = torch.optim.Adam(contextual_robust_opf_model.parameters(), lr = 1e-2, weight_decay=1e-4)
+contextual_robust_opf_model.train_model(train_data_loader, valid_data_loader, optimizer, epochs = num_epoch, patience = patience, validation = False)
 
-#tt = torch.FloatTensor(np.array([[0.2, 0.2], [0.1, .0]]))
-#scen_robust_opf_model = Scenario_Robust_OPF(2, 2,  tt, grid)
-#test = scen_robust_opf_model.forward( tt )
+# test evaluation
+#%%
+predicted_scenarios = contextual_robust_opf_model.predict(torch.FloatTensor(test_demand_samples), torch.FloatTensor(test_wind_samples) )
+cost_driven_sol = []
+for i in range(N_test_samples):
+    if i%1000==0: print(f'Observation:{i}')
+    # create problem vertices from conditional intervals
+    conditional_vertices = [r for r in itertools.product([cond_LB[i,0], cond_UB[i,0]], 
+                                             [cond_LB[i,1], cond_UB[i,1]])]
+    conditional_vertices = np.array(conditional_vertices)
+    temp_scen = to_np(predicted_scenarios[i])
+    
+    if i%500 == 0:
+        plt.scatter(conditional_vertices[:,0], conditional_vertices[:,1], color = 'black')
+        plt.scatter(temp_scen[:,0], temp_scen[:,1], color = 'red')
+        plt.ylim([-2,2])
+        plt.xlim([-2,2])
+        plt.show()
+    
+    #temp_box_scen_solution = robust_dcopf_scenarios(conditional_vertices, train_wind_samples, grid)
 
-scen_robust_opf_model = Scenario_Robust_OPF(num_uncertainties, num_scen, w_scenarios, support, grid, c_viol = c_viol)
-optimizer = torch.optim.Adam(scen_robust_opf_model.parameters(), lr = 1e-1)
-scen_robust_opf_model.train_model(train_data_loader, valid_data_loader, optimizer, epochs = num_epoch, patience = patience, validation = False)
+    temp_sol = da_clearing_layer(test_demand_samples[i], test_wind_samples[i], temp_scen)
+    
+    cost_driven_sol.append(temp_sol)
+    
 
-# solve problem with learned scenarios
-prescriptive_scenarios = scen_robust_opf_model.w_scenarios_param.detach().numpy()
-cost_driven_solution = robust_dcopf_scenarios(prescriptive_scenarios, w_expected, grid)
-
-solution_dictionaries['Cost-driven'] = cost_driven_solution
-#%% Visualize learned convex hull
-
-points = to_np(scen_robust_opf_model.w_scenarios_param)
-hull = ConvexHull(points)
-
-
-fig, ax = plt.subplots(figsize = (6,4))
-
-plt.scatter(train_errors[:,0], train_errors[:,1], alpha = 0.5)
-
-# data-driven box
-patches = []    
-box_vert = [r for r in itertools.product([h_lb[0], h_ub[0]], 
-                                         [h_lb[1], h_ub[1]])]
-box_vert.insert(2, box_vert[-1])
-box_vert = box_vert[:-1]
-
-box = Polygon(np.array(box_vert), fill = False, edgecolor = 'black', linewidth = 2, label = 'DD Box$_{98\%}$')
-patches.append(box)
-ax.add_patch(box)
-
-# full box
-patches = []    
-box_vert = [r for r in itertools.product([LB[0], UB[0]], [LB[1], UB[1]])]
-box_vert.insert(2, box_vert[-1])
-box_vert = box_vert[:-1]
-
-box = Polygon(np.array(box_vert), fill = False, 
-                  edgecolor = 'black', linestyle = '--', linewidth = 2, label = 'Full Box')
-patches.append(box)
-ax.add_patch(box)
-
-# Cost-driven convex hull
-points = to_np(scen_robust_opf_model.w_scenarios_param)
-plt.plot(points[:,0], points[:,1], 's', color = 'tab:red', label = 'Cost-driven Scen')
-for simplex in hull.simplices:
-    plt.plot(points[simplex, 0], points[simplex, 1], 'k-', color = 'tab:red', linestyle = '--', lw = 2)    
-#plt.plot(points[hull.vertices,0], points[hull.vertices,1], 'r--', lw=2)
-
-plt.ylim([-2, 2])
-plt.xlim([-2, 2])
-plt.legend(fontsize = 12)
-plt.xlabel('Error 1')
-plt.ylabel('Error 2')
-
-plt.show()
-
-#%% Out-of-sample test
+# Out-of-sample test
 from torch_layers import *
-
-N_test = 2000
-distr = 'normal'
-
-test_errors = create_wind_errors(N_test, grid['w_cap'], grid['w_exp'], std = 0.25, seed = 1)
-
-
-#xx = rt_clearing(cost_driven_solution, grid, c_viol, test_errors)
-#yy = rt_clearing(box_scen_solution, grid, c_viol, test_errors)
 
 output = pd.DataFrame(data = [], columns = ['DA_cost', 'RT_cost', 'Total_cost'])
 
-for i, method in enumerate(solution_dictionaries.keys()):
-    temp_sol = solution_dictionaries[method]
-    temp_output = pd.DataFrame(data = [], columns = ['DA_cost', 'RT_cost', 'Total_cost'], index = [method])
+solution_dictionaries = {}
+solution_dictionaries['Cost_driven'] = cost_driven_sol
+solution_dictionaries['Box_95'] = box_robust_sol
+
+for m, method in enumerate(solution_dictionaries.keys()):
     
-    temp_output.loc[method]['DA_cost'] = temp_sol['da_cost']
-    temp_output.loc[method]['RT_cost'] = RT_Clearing(grid, 2, c_viol).forward(temp_sol, torch.FloatTensor(test_errors)).mean()
-    temp_output.loc[method]['Total_cost'] = temp_output.loc[method]['DA_cost'] + temp_output.loc[method]['RT_cost']
+    list_sol_dict = solution_dictionaries[method]
+    
+    temp_output = pd.DataFrame(data = np.zeros((1,3)), columns = ['DA_cost', 'RT_cost', 'Total_cost'], index = [method])
+    
+    for i in range(N_test_samples):
+        temp_da_cost = list_sol_dict[i]['da_cost'].detach().numpy()
+        temp_rt_cost = RT_Clearing(grid, 2, c_viol).forward(list_sol_dict[i], torch.FloatTensor(test_wind_error[i])).mean()
+        
+        temp_output.loc[method]['DA_cost'] += temp_da_cost/N_test_samples
+        temp_output.loc[method]['RT_cost'] += temp_rt_cost/N_test_samples
+        temp_output.loc[method]['Total_cost'] += (temp_da_cost + temp_rt_cost)/N_test_samples
 
     output = pd.concat([output, temp_output])
     

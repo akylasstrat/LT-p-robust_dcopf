@@ -828,7 +828,10 @@ contextual_robust_opf_model.train_model(train_data_loader, valid_data_loader, op
 #%%
 predicted_scenarios = contextual_robust_opf_model.predict(torch.FloatTensor(test_demand_samples), torch.FloatTensor(test_wind_samples) )
 cost_driven_sol = []
+
 for i in range(N_test_samples):
+    if i == 0: da_clearing_layer = DA_RobustScen_Clearing(grid, 2, num_scen)
+
     if i%1000==0: print(f'Observation:{i}')
     # create problem vertices from conditional intervals
     conditional_vertices = [r for r in itertools.product([cond_LB[i,0], cond_UB[i,0]], 

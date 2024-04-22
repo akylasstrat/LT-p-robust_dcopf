@@ -734,6 +734,7 @@ wind_samples = np.random.uniform(0.5, 1.1, size = (N_samples, len(grid['w_exp'])
 
 corr = 0.5
 wind_error = []
+wind_error_samples = [] # only used for plotting
 quantiles = [0.025, 0.975]
 
 cond_UB = []
@@ -756,6 +757,7 @@ for i in range(N_samples):
     
     # realized errors (used for testing)
     wind_error.append(samples[0].reshape(-1))
+    wind_error_samples.append(samples)
     
 wind_error = np.array(wind_error)    
 cond_UB = np.array(cond_UB)
@@ -807,7 +809,7 @@ patience = 20
 batch_size = 2000
 num_epoch = 200
 
-num_scen = 4
+num_scen = 3
 
 train_data_loader = create_data_loader([tensor_train_demand, tensor_train_wind, tensor_train_wind_error], batch_size = batch_size)
 valid_data_loader = create_data_loader([tensor_train_demand, tensor_train_wind, tensor_train_wind_error], batch_size = batch_size)
@@ -825,7 +827,7 @@ optimizer = torch.optim.Adam(contextual_robust_opf_model.parameters(), lr = 1e-2
 contextual_robust_opf_model.train_model(train_data_loader, valid_data_loader, optimizer, epochs = num_epoch, patience = patience, validation = False)
 
 # test evaluation
-#%%
+
 predicted_scenarios = contextual_robust_opf_model.predict(torch.FloatTensor(test_demand_samples), torch.FloatTensor(test_wind_samples) )
 cost_driven_sol = []
 
@@ -839,24 +841,47 @@ for i in range(N_test_samples):
     conditional_vertices = np.array(conditional_vertices)
     temp_scen = to_np(predicted_scenarios[i])
     
-    if i%500 == 0:
-        plt.scatter(conditional_vertices[:,0], conditional_vertices[:,1], color = 'black')
-        plt.scatter(temp_scen[:,0], temp_scen[:,1], color = 'red')
-        plt.ylim([-2,2])
-        plt.xlim([-2,2])
+    if i%100 == 0:
+        
+        fig, ax = plt.subplots(figsize = (6,4))        
+        
+        plt.scatter(wind_error_samples[i][:100,0], wind_error_samples[i][:100,1], color = 'tab:blue', label = 'Sampled Scenarios', alpha = 0.5)
+        box_scen = conditional_vertices
+        hull = ConvexHull(box_scen)
+        plt.plot(box_scen[:,0], box_scen[:,1], 's', color = 'black', label = '90% Prediction Intervals')
+        for j, simplex in enumerate(hull.simplices):
+            if j == 0:
+                plt.plot(box_scen[simplex, 0], box_scen[simplex, 1], color = 'black', linestyle = '--', lw = 2)    
+            else:
+                plt.plot(box_scen[simplex, 0], box_scen[simplex, 1], color = 'black', linestyle = '--', lw = 2)    
+            
+        cost_driven_scen = temp_scen
+        hull = ConvexHull(cost_driven_scen)
+        plt.plot(cost_driven_scen[:,0], cost_driven_scen[:,1], 's', color = 'tab:red', label = 'Cost-driven scenarios')
+        for j, simplex in enumerate(hull.simplices):
+            if j == 0:
+                plt.plot(cost_driven_scen[simplex, 0], cost_driven_scen[simplex, 1], color = 'tab:red', linestyle = '--', lw = 2)    
+            else:
+                plt.plot(cost_driven_scen[simplex, 0], cost_driven_scen[simplex, 1], color = 'tab:red', linestyle = '--', lw = 2)    
+                    
+        plt.ylim([-1, 1])
+        plt.xlim([-1, 1])
+        plt.title(f'C_viol = {c_viol} \$/MWh', fontsize = 12)
+        plt.xlabel('Error 1')
+        plt.ylabel('Error 2')
+        plt.legend(fontsize = 12, loc = 'upper right')
         plt.show()
-    
-    #temp_box_scen_solution = robust_dcopf_scenarios(conditional_vertices, train_wind_samples, grid)
 
+    #temp_box_scen_solution = robust_dcopf_scenarios(conditional_vertices, train_wind_samples, grid)
     temp_sol = da_clearing_layer(test_demand_samples[i], test_wind_samples[i], temp_scen)
     
     cost_driven_sol.append(temp_sol)
     
-
+#%%
 # Out-of-sample test
 from torch_layers import *
 
-output = pd.DataFrame(data = [], columns = ['DA_cost', 'RT_cost', 'Total_cost'])
+#output = pd.DataFrame(data = [], columns = ['DA_cost', 'RT_cost', 'Total_cost'])
 
 solution_dictionaries = {}
 solution_dictionaries['Cost_driven'] = cost_driven_sol

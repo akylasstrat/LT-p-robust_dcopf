@@ -816,7 +816,7 @@ patience = 20
 batch_size = 2000
 num_epoch = 1000
 
-Num_scen_list = [3, 4, 5]
+Num_scen_list = [3, 4]
 
 train_data_loader = create_data_loader([tensor_train_demand, tensor_train_wind, tensor_train_wind_error], batch_size = batch_size)
 valid_data_loader = create_data_loader([tensor_train_demand, tensor_train_wind, tensor_train_wind_error], batch_size = batch_size)
@@ -837,7 +837,7 @@ for num_scen in Num_scen_list:
     
     # Train model
     contextual_robust_opf_model = Contextual_Scenario_Robust_OPF(mlp_param, num_uncertainties, num_scen, grid, w_init_error_scen, c_viol = c_viol)
-    optimizer = torch.optim.Adam(contextual_robust_opf_model.parameters(), lr = 1e-2, weight_decay=1e-4)
+    optimizer = torch.optim.Adam(contextual_robust_opf_model.parameters(), lr = 1e-2, weight_decay=1e-3)
     contextual_robust_opf_model.train_model(train_data_loader, valid_data_loader, optimizer, epochs = num_epoch, patience = patience, validation = False)
     contextual_models_list.append(contextual_robust_opf_model)
     

@@ -903,6 +903,89 @@ plt.ylabel('Error 2')
 
 plt.show()
 
+#%% Visualize congestions for learned policy
+
+# estimate a grid of optimal dispatches
+w1_error_grid = np.arange(LB[0], UB[0], 0.1)
+w2_error_grid = np.arange(LB[1], UB[1], 0.1)
+
+xv, yv = np.meshgrid(w1_error_grid, w2_error_grid)
+w_joint_grid = np.array([xv.ravel(), yv.ravel()]).T
+#%%
+#w_error_grid = np.ones((len(w_joint),3))
+
+grid_cost = RT_Clearing(grid, 2, c_viol).forward(solution_dictionaries['Cost-driven'], torch.FloatTensor(w_joint_grid))
+
+cost_surface = grid_cost.reshape(len(xv),-1)
+error1_surface = w_joint_grid[:,0].reshape(len(xv),-1)
+error2_surface = w_joint_grid[:,1].reshape(len(xv),-1)
+
+# 3-d surface plot
+import matplotlib.pyplot as plt
+from matplotlib import cm
+from matplotlib.ticker import LinearLocator
+import numpy as np
+
+fig, ax = plt.subplots(subplot_kw={"projection": "3d"}, figsize = (5,5))
+
+# Plot the surface.
+surf = ax.plot_surface(xv, yv, cost_surface, cmap=cm.coolwarm, alpha = 0.75,
+                       linewidth=0, antialiased=False)
+
+
+# Customize the z axis.
+ax.zaxis.set_major_locator(LinearLocator(10))
+# A StrMethodFormatter is used automatically
+ax.zaxis.set_major_formatter('{x:.02f}')
+
+ax.set_xlabel('Error 1' )
+ax.set_ylabel('Error 2' )
+#ax.set_ylabel('$d_'+str(ind_var_d[1])+'$ (MW)' )
+# Add a color bar which maps values to colors.
+fig.colorbar(surf, shrink = 0.25, aspect = 7)
+plt.show()
+
+cs = plt.contourf(xv, yv, cost_surface,
+    colors=['#808080', '#A0A0A0', '#C0C0C0'], extend='both')
+#cs.cmap.set_over('red')
+#cs.cmap.set_under('blue')
+cs.changed()
+
+#%%
+# Plot system regions with the same sets of binding constraints
+sr1 = plt.contourf(xv, yv, cost_surface, alpha = 1,
+    colors=['#808080', '#A0A0A0', '#C0C0C0'], extend='both')
+sr1.cmap.set_over('white')
+sr1.cmap.set_under('tab:blue')
+sr1.changed()
+
+sr2 = plt.contourf(xv, yv, cost_surface, alpha = .5,
+    colors=['#808080', '#A0A0A0', '#C0C0C0'], extend='both')
+sr2.cmap.set_over('white')
+sr2.cmap.set_under('tab:green')
+sr2.changed()
+
+#%% Solve for all the grid, find when slacks are activated
+
+opf_model = dc_opf_model(grid, demands_grid, horizon = 1, network = True, plot = False)
+
+g_opt_path = []
+Slacks = []
+for d_i in demands_grid:
+    opf_model.setParam('OutputFlag', 0)
+    c1 = opf_model.addConstr(opf_model._vars['node_d_i'] == d_i.reshape(-1))
+    opf_model.optimize()
+    print(opf_model.CBasis)
+    # 0 (basic), -1 non-basic
+    Slacks.append([np.abs(c.Slack) > 0 for c in opf_model.getConstrs()])
+    g_opt_path.append(opf_model._vars['p_G'].X)
+    for c in [c1]:
+        opf_model.remove(c)            
+Slacks = 1*np.array(Slacks)
+g_opt_path = np.array(g_opt_path)
+cost_opt = g_opt_path@grid['Cost']
+
+
 #%% Out-of-sample test
 from torch_layers import *
 

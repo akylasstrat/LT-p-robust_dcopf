@@ -1354,6 +1354,11 @@ class RT_Clearing(nn.Module):
 
         self.Pmax = torch.FloatTensor(Pmax)
         self.Pmin = torch.FloatTensor(np.zeros(grid['n_unit']))
+        
+        self.node_G = node_G
+        self.node_L = node_L
+        self.node_W = node_W
+
         self.Cost = torch.FloatTensor(Cost)
         self.C_r_up = torch.FloatTensor(C_r_up)
         self.C_r_down = torch.FloatTensor(C_r_down)
@@ -1375,6 +1380,7 @@ class RT_Clearing(nn.Module):
         g_shed = cp.Variable(grid['n_unit'], nonneg = True)
         l_shed = cp.Variable(grid['n_loads'], nonneg = True)
         cost_RT = cp.Variable(1, nonneg = True)
+
         
         RT_sched_constraints = []
 
@@ -1395,7 +1401,7 @@ class RT_Clearing(nn.Module):
                                            variables = [recourse_up, recourse_down, g_shed, l_shed, cost_RT] )
 
 
-    def forward(self, sol_dict, w_error_scen):
+    def forward(self, sol_dict, w_error_scen, return_cong_slack = False):
         
         p_hat = torch.FloatTensor(sol_dict['p_da'])
         r_up_hat = torch.FloatTensor(sol_dict['r_up'])
@@ -1416,7 +1422,8 @@ class RT_Clearing(nn.Module):
         rt_output = self.rt_layer(r_up_hat_proj, r_down_hat_proj, f_margin_up_hat_proj, f_margin_down_hat_proj, 
                                   w_error_scen, solver_args={'max_iters':100_000})                
         cost_RT_hat = rt_output[-1]
-        
         rt_loss = cost_RT_hat.mean()
+
+        if return_cong_slack == False:
             
-        return to_np(cost_RT_hat)
+            return to_np(cost_RT_hat)

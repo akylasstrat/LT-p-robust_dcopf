@@ -827,7 +827,7 @@ patience = 30
 batch_size = 2000
 num_epoch = 1000
 
-num_scen = 10
+num_scen = 4
 w_scenarios = np.array(box_vert)
 
 # support of uncertain parameters (used in projection step, avoid infeasibilities)

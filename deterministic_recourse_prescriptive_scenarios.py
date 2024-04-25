@@ -666,8 +666,8 @@ ptdf = np.matrix(ptdf_str)
 
 basemva = 100
 genloc = np.array([1, 1, 3, 4, 5]) -1
-windloc = np.array([3, 5]) - 1  # standard wind farm location
-# windloc = np.array([3, 2]) - 1  # configuration B
+# windloc = np.array([3, 5]) - 1  # standard wind farm location, configuration A
+windloc = np.array([3, 2]) - 1  # configuration B
 
 smax = np.array([4.0, 1.9, 2.2, 1.0, 1.0, 2.4])
 

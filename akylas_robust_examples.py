@@ -463,6 +463,11 @@ def create_wind_errors(N, capacity, expected, distr = 'normal', plot = True, std
         R = np.tril(a) + np.tril(a, -1).T
         for i in range(grid['n_wind']): 
             R[i,i] = 1
+        
+        R = np.array( [[1, 0.1],[0.1, 1]] )
+        
+
+        print(R)
         # estimate covariance matrix
         S_cov = np.diag(std_Pd)@R@np.diag(std_Pd)        
         # sample demands, project them into support
@@ -506,8 +511,8 @@ ptdf = np.matrix(ptdf_str)
 
 basemva = 100
 genloc = np.array([1, 1, 3, 4, 5]) -1
-windloc = np.array([3, 5]) - 1  # standard wind farm location
-# windloc = np.array([3, 2]) - 1  # configuration B
+# windloc = np.array([3, 5]) - 1  # standard wind farm location
+windloc = np.array([3, 2]) - 1  # configuration B
 
 smax = np.array([4.0, 1.9, 2.2, 1.0, 1.0, 2.4])
 

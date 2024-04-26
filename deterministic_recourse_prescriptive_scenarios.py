@@ -904,7 +904,7 @@ patches.append(box)
 ax.add_patch(box)
 
 # CAISO scen
-plt.scatter(caiso_scen[:,0], caiso_scen[:,1], color = 'tab:brown', marker = '+', label = 'CAISO', s = 200, linewidth = 3)
+plt.scatter(caiso_scen[:,0], caiso_scen[:,1], color = 'yellow', marker = '+', label = 'CAISO', s = 200, linewidth = 3)
 
 
 # Cost-driven convex hull

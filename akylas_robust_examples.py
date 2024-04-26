@@ -897,8 +897,11 @@ plt.ylim([-2, 2])
 plt.xlim([-2, 2])
 plt.legend(fontsize = 10, ncol = 4)
 plt.show()
+#%%
+output['Total_cost'] = output['DA_cost'] + output['RT_cost']
 
-
+output.T.plot(kind='bar')
+plt.show()
 #%%
 H_tensor = nn.Parameter(torch.FloatTensor(H_bound).requires_grad_())
 h_tensor = nn.Parameter(torch.FloatTensor(h_bound).requires_grad_())

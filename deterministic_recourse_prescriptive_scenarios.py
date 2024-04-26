@@ -816,6 +816,21 @@ for a in np.array(alpha).round(2):
 #box_scen_solution = robust_dcopf_scenarios(w_scenarios, w_expected, grid)
 #box_scen_solution = robust_dcopf_scenarios(w_scenarios, w_expected, grid)
 
+#%% CAISO's approach
+
+aggr_error = train_errors.sum(1)
+# histogram-based aggregated error bounds (system-wide requirement)
+aggr_lb, aggr_ub = np.quantile(aggr_error, [0.05, 0.95])
+# distribution of to nodes based on 
+
+caiso_h_lb = aggr_lb*(train_errors.std(0)/train_errors.std(0).sum())
+caiso_h_ub = aggr_ub*(train_errors.std(0)/train_errors.std(0).sum())
+
+caiso_scen = np.vstack((caiso_h_lb, caiso_h_ub))
+
+temp_box_scen_solution = robust_dcopf_scenarios(caiso_scen, w_expected, grid)
+solution_dictionaries[f'CAISO_{int(90)}'] = temp_box_scen_solution
+
 #%%
 
 UB_init = grid['w_cap'] - grid['w_exp'] - 1
@@ -827,7 +842,7 @@ patience = 30
 batch_size = 2000
 num_epoch = 1000
 
-num_scen = 4
+num_scen = 3
 w_scenarios = np.array(box_vert)
 
 # support of uncertain parameters (used in projection step, avoid infeasibilities)
@@ -887,6 +902,10 @@ box = Polygon(np.array(box_vert), fill = False,
                   edgecolor = 'black', linestyle = '--', linewidth = 2, label = 'Full Box')
 patches.append(box)
 ax.add_patch(box)
+
+# CAISO scen
+plt.scatter(caiso_scen[:,0], caiso_scen[:,1], color = 'tab:brown', marker = '+', label = 'CAISO', s = 200, linewidth = 3)
+
 
 # Cost-driven convex hull
 points = to_np(scen_robust_opf_model.w_scenarios_param)

@@ -820,7 +820,7 @@ for a in np.array(alpha).round(2):
 
 aggr_error = train_errors.sum(1)
 # histogram-based aggregated error bounds (system-wide requirement)
-aggr_lb, aggr_ub = np.quantile(aggr_error, [0.05, 0.95])
+aggr_lb, aggr_ub = np.quantile(aggr_error, [0.025, 0.975])
 # distribution of to nodes based on 
 
 caiso_h_lb = aggr_lb*(train_errors.std(0)/train_errors.std(0).sum())

@@ -933,7 +933,7 @@ w_joint_grid = np.array([xv.ravel(), yv.ravel()]).T
 #%%
 #w_error_grid = np.ones((len(w_joint),3))
 
-grid_cost = RT_Clearing(grid, 2, c_viol).forward(solution_dictionaries['Cost-driven'], torch.FloatTensor(w_joint_grid))
+grid_cost = RT_Clearing(grid, 2, c_viol).forward(solution_dictionaries['CAISO_90'], torch.FloatTensor(w_joint_grid))
 
 cost_surface = grid_cost.reshape(len(xv),-1)
 error1_surface = w_joint_grid[:,0].reshape(len(xv),-1)

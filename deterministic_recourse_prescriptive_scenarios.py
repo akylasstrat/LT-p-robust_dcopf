@@ -412,8 +412,9 @@ def robust_dcopf_scenarios(error_scenarios, w_expected, grid, network = True, sl
     r_down_G = m.addMVar((grid['n_unit']), vtype = gp.GRB.CONTINUOUS, lb = 0, name = 'downward reserve')
     
     # recourse per scenarios
-    p_recourse = m.addMVar((grid['n_unit'], num_scen), vtype = gp.GRB.CONTINUOUS, lb = -gp.GRB.INFINITY)
-    #p_recourse_down = m.addMVar((grid['n_unit'], num_scenarios), vtype = gp.GRB.CONTINUOUS, lb = 0)
+    # p_recourse = m.addMVar((grid['n_unit'], num_scen), vtype = gp.GRB.CONTINUOUS, lb = -gp.GRB.INFINITY)
+    p_recourse_up = m.addMVar((grid['n_unit'], num_scen), vtype = gp.GRB.CONTINUOUS, lb = 0)
+    p_recourse_down = m.addMVar((grid['n_unit'], num_scen), vtype = gp.GRB.CONTINUOUS, lb = 0)
     
     f_margin_up = m.addMVar((grid['n_lines']), vtype = gp.GRB.CONTINUOUS, lb = 0, name = 'upward reserve')
     f_margin_down = m.addMVar((grid['n_lines']), vtype = gp.GRB.CONTINUOUS, lb = 0, name = 'downward reserve')    
@@ -435,16 +436,15 @@ def robust_dcopf_scenarios(error_scenarios, w_expected, grid, network = True, sl
     #### Constraints per scenario
     
     # aggregate error
-    m.addConstrs( p_recourse[:,s].sum() + error_scenarios[s].sum() == 0 for s in range(num_scen))
+    m.addConstrs( p_recourse_up[:,s].sum() - p_recourse_down[:,s].sum() + error_scenarios[s].sum() == 0 for s in range(num_scen))
     
-    m.addConstrs( p_recourse[:,s] <= r_up_G for s in range(num_scen))
-    m.addConstrs( -p_recourse[:,s] <= r_down_G for s in range(num_scen))
+    m.addConstrs( p_recourse_up[:,s] <= r_up_G for s in range(num_scen))
+    m.addConstrs( p_recourse_down[:,s] <= r_down_G for s in range(num_scen))
             
-    if network:
-        
-        m.addConstrs( PTDF@(node_G@p_recourse[:,s] + node_W@error_scenarios[s]) <= f_margin_up for s in range(num_scen))
-        m.addConstrs( -PTDF@(node_G@p_recourse[:,s] + node_W@error_scenarios[s]) <= f_margin_down for s in range(num_scen))
-                                   
+    if network:        
+        m.addConstrs( PTDF@(node_G@(p_recourse_up[:,s]-p_recourse_down[:,s]) + node_W@error_scenarios[s]) <= f_margin_up for s in range(num_scen))
+        m.addConstrs( -PTDF@(node_G@(p_recourse_up[:,s]-p_recourse_down[:,s]) + node_W@error_scenarios[s]) <= f_margin_down for s in range(num_scen))
+                             
     m.setObjective( Cost@p_G + C_r_up@r_up_G + C_r_down@r_down_G, gp.GRB.MINIMIZE)             
     m.optimize()
     
@@ -454,7 +454,8 @@ def robust_dcopf_scenarios(error_scenarios, w_expected, grid, network = True, sl
         rob_sol['p_da'] = p_G.X
         rob_sol['r_up'] = r_up_G.X
         rob_sol['r_down'] = r_down_G.X
-        rob_sol['p_recourse'] = p_recourse.X
+        rob_sol['p_recourse_up'] = p_recourse_up.X
+        rob_sol['p_recourse_down'] = p_recourse_down.X
         rob_sol['f_margin_up'] = f_margin_up.X
         rob_sol['f_margin_down'] = f_margin_down.X
         
@@ -717,7 +718,6 @@ train_errors = create_wind_errors(N_samples, grid['w_cap'], grid['w_exp'], distr
 
 
 # Upper and lower bounds for errors
-
 UB = grid['w_cap'] - grid['w_exp']
 LB = - grid['w_exp']
 
@@ -838,11 +838,11 @@ LB_init = - grid['w_exp'] + 1
 
 from torch_layers import *
 
-patience = 30
-batch_size = 2000
+patience = 10
+batch_size = 500
 num_epoch = 1000
 
-num_scen = 3
+num_scen = 4
 w_scenarios = np.array(box_vert)
 
 # support of uncertain parameters (used in projection step, avoid infeasibilities)
@@ -856,7 +856,7 @@ w_scenarios = np.random.normal(loc = 0, scale = 0.5, size = (num_scen, num_uncer
 tensor_trainY = torch.FloatTensor(train_errors)
 
 train_data_loader = create_data_loader([tensor_trainY], batch_size = batch_size)
-valid_data_loader = create_data_loader([tensor_trainY], batch_size = batch_size)
+# valid_data_loader = create_data_loader([tensor_trainY], batch_size = batch_size)
 
 #tt = torch.FloatTensor(np.array([[0.2, 0.2], [0.1, .0]]))
 #scen_robust_opf_model = Scenario_Robust_OPF(2, 2,  tt, grid)
@@ -864,7 +864,7 @@ valid_data_loader = create_data_loader([tensor_trainY], batch_size = batch_size)
 
 scen_robust_opf_model = Scenario_Robust_OPF(num_uncertainties, num_scen, w_scenarios, support, grid, c_viol = c_viol)
 optimizer = torch.optim.Adam(scen_robust_opf_model.parameters(), lr = 1e-1)
-scen_robust_opf_model.train_model(train_data_loader, valid_data_loader, optimizer, epochs = num_epoch, patience = patience, validation = False)
+scen_robust_opf_model.train_model(train_data_loader, train_data_loader, optimizer, epochs = num_epoch, patience = patience, validation = False)
 
 # solve problem with learned scenarios
 prescriptive_scenarios = scen_robust_opf_model.w_scenarios_param.detach().numpy()
@@ -948,7 +948,7 @@ import numpy as np
 fig, ax = plt.subplots(subplot_kw={"projection": "3d"}, figsize = (5,5))
 
 # Plot the surface.
-surf = ax.plot_surface(xv, yv, cost_surface, cmap=cm.coolwarm, alpha = 0.75,
+surf = ax.plot_surface(xv, yv, cost_surface/1e3, cmap=cm.coolwarm, alpha = 0.75,
                        linewidth=0, antialiased=False)
 
 
@@ -986,23 +986,23 @@ sr2.changed()
 
 #%% Solve for all the grid, find when slacks are activated
 
-opf_model = dc_opf_model(grid, demands_grid, horizon = 1, network = True, plot = False)
+# opf_model = dc_opf_model(grid, demands_grid, horizon = 1, network = True, plot = False)
 
-g_opt_path = []
-Slacks = []
-for d_i in demands_grid:
-    opf_model.setParam('OutputFlag', 0)
-    c1 = opf_model.addConstr(opf_model._vars['node_d_i'] == d_i.reshape(-1))
-    opf_model.optimize()
-    print(opf_model.CBasis)
-    # 0 (basic), -1 non-basic
-    Slacks.append([np.abs(c.Slack) > 0 for c in opf_model.getConstrs()])
-    g_opt_path.append(opf_model._vars['p_G'].X)
-    for c in [c1]:
-        opf_model.remove(c)            
-Slacks = 1*np.array(Slacks)
-g_opt_path = np.array(g_opt_path)
-cost_opt = g_opt_path@grid['Cost']
+# g_opt_path = []
+# Slacks = []
+# for d_i in demands_grid:
+#     opf_model.setParam('OutputFlag', 0)
+#     c1 = opf_model.addConstr(opf_model._vars['node_d_i'] == d_i.reshape(-1))
+#     opf_model.optimize()
+#     print(opf_model.CBasis)
+#     # 0 (basic), -1 non-basic
+#     Slacks.append([np.abs(c.Slack) > 0 for c in opf_model.getConstrs()])
+#     g_opt_path.append(opf_model._vars['p_G'].X)
+#     for c in [c1]:
+#         opf_model.remove(c)            
+# Slacks = 1*np.array(Slacks)
+# g_opt_path = np.array(g_opt_path)
+# cost_opt = g_opt_path@grid['Cost']
 
 
 #%% Out-of-sample test
@@ -1033,6 +1033,24 @@ fig, ax = plt.subplots()
 output.T.plot(kind = 'bar', ax = ax)
 plt.show()
 
+#%%
+print('Test for different values of violation penalty')
+for c in [200, 2000, 10000]:
+    output = pd.DataFrame(data = [], columns = ['DA_cost', 'RT_cost', 'Total_cost'])
+
+    for i, method in enumerate(solution_dictionaries.keys()):
+        temp_sol = solution_dictionaries[method]
+        temp_output = pd.DataFrame(data = [], columns = ['DA_cost', 'RT_cost', 'Total_cost'], index = [method])
+        
+        temp_output.loc[method]['DA_cost'] = temp_sol['da_cost']
+        temp_output.loc[method]['RT_cost'] = RT_Clearing(grid, 2, c).forward(temp_sol, torch.FloatTensor(test_errors)).mean()
+        temp_output.loc[method]['Total_cost'] = temp_output.loc[method]['DA_cost'] + temp_output.loc[method]['RT_cost']
+    
+        output = pd.concat([output, temp_output])
+        
+    fig, ax = plt.subplots()
+    output.T.plot(kind = 'bar', ax = ax)
+    plt.show()
 
 
 

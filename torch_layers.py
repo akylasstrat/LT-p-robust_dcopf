@@ -513,6 +513,8 @@ class Scenario_Robust_OPF(nn.Module):
         f_margin_up = cp.Variable((grid['n_lines']), nonneg = True)
         f_margin_down = cp.Variable((grid['n_lines']), nonneg = True)
         
+        DA_cost = cp.Variable((1), nonneg = True)
+        
         #### recourse decisions
         p_rt_up = cp.Variable((grid['n_unit'], num_scen), nonneg = True)
         p_rt_down = cp.Variable((grid['n_unit'], num_scen), nonneg = True)
@@ -534,13 +536,14 @@ class Scenario_Robust_OPF(nn.Module):
                         + [PTDF@(node_G@(p_rt_up[:,s] - p_rt_down[:,s]) + (slack_up - slack_down) + node_W@w_scen_param[s]) <= f_margin_up for s in range(num_scen)]\
                         + [-PTDF@(node_G@(p_rt_up[:,s] - p_rt_down[:,s]) + (slack_up - slack_down) + node_W@w_scen_param[s]) <= f_margin_down for s in range(num_scen)]\
         
-        DA_cost_expr = Cost@p_G + C_r_up@r_up_G + C_r_down@r_down_G + c_viol*(slack_up.sum() + slack_down.sum())
-        objective_funct = cp.Minimize( DA_cost_expr ) 
-                
+        DA_constraints += [DA_cost == grid['Cost']@p_G + grid['C_r_up']@r_up_G 
+                           + grid['C_r_down']@r_down_G + c_viol*(slack_up.sum() + slack_down.sum())]
+        
+        objective_funct = cp.Minimize( DA_cost )                 
         robust_opf_problem = cp.Problem(objective_funct, DA_constraints + Robust_constr)
          
         self.robust_opf_layer = CvxpyLayer(robust_opf_problem, parameters=[w_scen_param],
-                                           variables = [p_G, r_up_G, r_down_G, p_rt_up, p_rt_down, f_margin_up, f_margin_down])
+                                           variables = [p_G, r_up_G, r_down_G, p_rt_up, p_rt_down, f_margin_up, f_margin_down, DA_cost])
                                         
         
         ###### RT market layer/ full re-dispatch
@@ -571,7 +574,7 @@ class Scenario_Robust_OPF(nn.Module):
                 
         # balancing
         RT_sched_constraints += [ recourse_up.sum() - recourse_down.sum() + w_realized_error.sum() + (slack_up -  slack_down).sum() == 0]
-        RT_sched_constraints += [cost_RT == self.c_viol*(slack_up.sum() + slack_down.sum()) ]
+        RT_sched_constraints += [cost_RT == c_viol*(slack_up.sum() + slack_down.sum()) ]
             
         objective_funct = cp.Minimize( cost_RT ) 
         rt_problem = cp.Problem(objective_funct, RT_sched_constraints)
@@ -591,12 +594,13 @@ class Scenario_Robust_OPF(nn.Module):
             torch.Tensor: CVXPY output, see above
         """
         # Pass the combined output to the CVXPY layer
-        cvxpy_output = self.robust_opf_layer(w_scen, solver_args={'max_iters':500_000})
-
+        try:
+            cvxpy_output = self.robust_opf_layer(w_scen, solver_args={'max_iters':20_000, "solve_method": "ECOS"})
+        except:            
+            cvxpy_output = self.robust_opf_layer(w_scen, solver_args={'max_iters':20_000})
         return cvxpy_output
     
-    def train_model(self, train_loader, val_loader, optimizer, epochs = 20, patience=5, projection = True, validation = False, 
-                    relative_tolerance = 0):
+    def epoch_train(self, loader, opt=None):
         """
         Training: learning parameters w_scen for an uncertainty set Xi = { xi_i}, for i = 1,..., n
 
@@ -611,62 +615,74 @@ class Scenario_Robust_OPF(nn.Module):
         Returns:
             torch.Tensor: outputs of CVXPY layer, see declaration above
         """                
-        #L_t = []
-        best_train_loss = 1e7
-        best_val_loss = 1e7 
+
+        total_loss = 0.
+        
+        for i, batch_data in enumerate(loader):
+        
+            y_batch = batch_data[0]
+
+            # Forward pass: solve robust OPF
+            decisions_hat = self.forward(self.w_scenarios_param)
+            
+            p_hat = decisions_hat[0]
+            r_up_hat = decisions_hat[1]
+            r_down_hat = decisions_hat[2]
+            f_margin_up_hat = decisions_hat[5]
+            f_margin_down_hat = decisions_hat[6]
+            cost_DA_hat = decisions_hat[-1]
+            
+            # Project to feasible set (might incur numerical errors)
+            p_hat_proj = torch.maximum(torch.minimum(p_hat, self.Pmax), self.Pmin)
+            r_up_hat_proj = torch.maximum(torch.minimum(r_up_hat, self.Pmax - p_hat_proj), torch.zeros(self.grid['n_unit']))
+            r_down_hat_proj = torch.maximum(torch.minimum(r_down_hat, p_hat_proj), torch.zeros(self.grid['n_unit']))
+            f_margin_up_hat_proj = torch.maximum(f_margin_up_hat, torch.zeros(self.grid['n_lines']) ) 
+            f_margin_down_hat_proj = torch.maximum(f_margin_down_hat, torch.zeros(self.grid['n_lines']) ) 
+            
+
+            # RT dispatch cost (penalize violations)
+            try:
+                rt_output = self.rt_layer(r_up_hat_proj, r_down_hat_proj, f_margin_up_hat_proj, f_margin_down_hat_proj, 
+                                          y_batch, solver_args={'max_iters':50_000, "solve_method": "ECOS"}) 
+            except:
+                rt_output = self.rt_layer(r_up_hat_proj, r_down_hat_proj, f_margin_up_hat_proj, f_margin_down_hat_proj, 
+                                          y_batch, solver_args={'max_iters':50_000, "solve_method": "SCS"}) 
+                
+            cost_RT_hat = rt_output[-1]
+            
+            loss = cost_DA_hat.mean() + cost_RT_hat.mean()
+            
+            if opt:
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+                
+                ### Projection step// box support
+                w_proj = torch.maximum(torch.minimum( self.w_scenarios_param, self.support_UB), self.support_LB)
+                with torch.no_grad():
+                    self.w_scenarios_param.copy_(w_proj)
+
+            total_loss += loss.item() * len(y_batch)
+            
+        return total_loss / len(loader.dataset)
+        
+    def train_model(self, train_loader, val_loader, optimizer, epochs = 20, patience=5, verbose = 0, validation = False):
+        
+        # best_train_loss = float('inf')
+        best_val_loss = float('inf')
         early_stopping_counter = 0
         best_weights = copy.deepcopy(self.state_dict())
 
-        Pmax_tensor = torch.FloatTensor(self.grid['Pmax'].reshape(-1))
-        Pmin_tensor = torch.FloatTensor(self.grid['Pmin'].reshape(-1))
-        
-        # estimate initial loss
-        print('Estimate Initial Loss...')
-        '''
-        initial_train_loss = 0
-        with torch.no_grad():
-            for batch_data in train_loader:
-                y_batch = batch_data[-1]
-                # clear gradients
-                optimizer.zero_grad()
-                output_hat = self.forward(batch_data[:-1])
-                
-                pdf_comb_hat = output_hat[0]
-                cdf_comb_hat = pdf_comb_hat.cumsum(1)
-                
-                decisions_hat = output_hat[1][0]                
-                p_hat = decisions_hat[0]
-                
-                # Project p_hat to feasible set
-                p_hat_proj = torch.maximum(torch.minimum(p_hat, Pmax_tensor), Pmin_tensor)
-                cost_DA_hat = decisions_hat[-1]
-
-                # solve RT layer, find redispatch cost                
-                rt_output = self.rt_layer(p_hat_proj, y_batch.reshape(-1,1), solver_args={'max_iters':50_000})                
-                # CRPS of combination
-                crps_i = sum([torch.square( cdf_comb_hat[i] - 1*(self.support >= y_batch[i]) ).sum() for i in range(len(y_batch))])
-                loss = cost_DA_hat.mean() + rt_output[-1].mean() + self.gamma*crps_i
- 
-                initial_train_loss += loss.item()
-                
-        initial_train_loss = initial_train_loss/len(train_loader)
-        best_train_loss = initial_train_loss
-        print(f'Initial Estimate: {best_train_loss}')
-        '''                
         for epoch in range(epochs):
             # activate train functionality
             self.train()
-            running_loss = 0.0                
-            
 
-            # sample batch data
-            for batch_iter, batch_data in enumerate(train_loader):
-                # wind forecast error realizations
-                y_batch = batch_data[0]
+            # visualize current scenarios and the induced convex hull
+            if ((epoch)%5 == 0): 
 
-                # visualize current scenarios and the induced convex hull
-                if ((epoch)%5 == 0) and (batch_iter == 0):
-                                    
+                for batch in train_loader:
+                    y_batch = batch[0]
+                    
                     fig, ax = plt.subplots(figsize = (6,4))                
                     w_scen = to_np(self.w_scenarios_param)
                     plt.scatter(y_batch[:,0], y_batch[:,1], label = 'Data')                    
@@ -680,130 +696,35 @@ class Scenario_Robust_OPF(nn.Module):
                             plt.plot(w_scen[simplex, 0], w_scen[simplex, 1], color = 'tab:red', linestyle = '--', lw = 2)    
                     plt.ylim([-2, 2])
                     plt.xlim([-2, 2])
-                    plt.title(f'C_viol = {self.c_viol} \$/MWh, Iteration: {epoch}', fontsize = 12)
+                    plt.title(f'C_viol = {self.c_viol} \$/MWh', fontsize = 12)
                     plt.xlabel('Error 1')
                     plt.xlabel('Error 2')
                     plt.legend(fontsize = 12, loc = 'upper right')
                     plt.show()
+                    break
 
-                
-                # clear gradients
-                optimizer.zero_grad()
+            average_train_loss = self.epoch_train(train_loader, optimizer)
 
-                # Forward pass: solve robust OPF
-                decisions_hat = self.forward(self.w_scenarios_param)
-                
-                p_hat = decisions_hat[0]
-                r_up_hat = decisions_hat[1]
-                r_down_hat = decisions_hat[2]
-                f_margin_up_hat = decisions_hat[5]
-                f_margin_down_hat = decisions_hat[6]
-                
-                # Project to feasible set (might incur numerical errors)
-                p_hat_proj = torch.maximum(torch.minimum(p_hat, self.Pmax), self.Pmin)
-                r_up_hat_proj = torch.maximum(torch.minimum(r_up_hat, self.Pmax - p_hat_proj), torch.zeros(self.grid['n_unit']))
-                r_down_hat_proj = torch.maximum(torch.minimum(r_down_hat, p_hat_proj), torch.zeros(self.grid['n_unit']))
-                
-                f_margin_up_hat_proj = torch.maximum(f_margin_up_hat, torch.zeros(self.grid['n_lines']) ) 
-                f_margin_down_hat_proj = torch.maximum(f_margin_down_hat, torch.zeros(self.grid['n_lines']) ) 
-                
-                # Evaluate cost-driven error
-                # DA cost                
-                cost_DA_hat = self.Cost@p_hat + self.C_r_up@r_up_hat + self.C_r_down@r_down_hat
-
-                # RT dispatch cost (penalize violations)
-                rt_output = self.rt_layer(r_up_hat_proj, r_down_hat_proj, f_margin_up_hat_proj, f_margin_down_hat_proj, 
-                                          y_batch, solver_args={'max_iters':500_000})                
-                cost_RT_hat = rt_output[-1]
-                
-                loss = cost_DA_hat.mean() + cost_RT_hat.mean()
-                    
-                # backward pass
-                # forward pass: combine forecasts and each stochastic ED problem
-                loss.backward()
-                optimizer.step()
-                
-                # Project back to box of support 
-                w_proj = torch.maximum(torch.minimum( self.w_scenarios_param, self.support_UB), self.support_LB)
-                # update parameter values
-                with torch.no_grad():
-                    self.w_scenarios_param.copy_(w_proj)
-                    
-                running_loss += loss.item()
-                
-                
-            average_train_loss = running_loss / len(train_loader)
-                                        
-            if validation == True:
-                # evaluate performance on stand-out validation set
-                val_loss = self.evaluate(val_loader)
-                print(f"Epoch [{epoch + 1}/{epochs}] - Train Loss: {average_train_loss:.4f} - Val Loss: {val_loss:.4f}")
-                
-                if (val_loss < best_val_loss) and ( (best_val_loss-val_loss)/best_val_loss > relative_tolerance):
-                    best_val_loss = val_loss
-                    best_weights = copy.deepcopy(self.state_dict())
-                    early_stopping_counter = 0
-                else:
-                    early_stopping_counter += 1
-                    if early_stopping_counter >= patience:
-                        print("Early stopping triggered.")
-                        # recover best weights
-                        self.load_state_dict(best_weights)
-                        return
+            if validation:
+                val_loss = self.epoch_train(val_loader)
             else:
-                # only evaluate on training data set
-                print(f"Epoch [{epoch + 1}/{epochs}] - Train Loss: {average_train_loss:.4f} ")
-    
-                if (average_train_loss < best_train_loss) and ( (best_train_loss-average_train_loss)/best_train_loss > relative_tolerance):
-                    best_train_loss = average_train_loss
-                    best_weights = copy.deepcopy(self.state_dict())
-                    early_stopping_counter = 0
-                    
-                else:
-                    early_stopping_counter += 1
-                    if early_stopping_counter >= patience:
-                        print("Early stopping triggered.")
-                        # recover best weights
-                        self.load_state_dict(best_weights)
-                        return
-        
-        print('Reached epoch limit.')
-        self.load_state_dict(best_weights)
-        return
+                val_loss = average_train_loss
+            
+            if verbose != -1:
+                print(f"Epoch [{epoch + 1}/{epochs}] - Train Loss: {average_train_loss:.4f} - Val Loss: {val_loss:.4f}")
 
-    def evaluate(self, data_loader):
-        # evaluate loss criterion/ used for estimating validation loss
-        self.eval()
-        total_loss = 0.0
-        with torch.no_grad():
-            for batch_data in data_loader:
-                y_batch = batch_data[-1]
-
-                # forward pass: combine forecasts and each stochastic ED problem
-                output_hat = self.forward(batch_data[:-1])
-
-                pdf_comb_hat = output_hat[0]
-                cdf_comb_hat = pdf_comb_hat.cumsum(1)
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_weights = copy.deepcopy(self.state_dict())
+                early_stopping_counter = 0
+            else:
+                early_stopping_counter += 1
+                if early_stopping_counter >= patience:
+                    print("Early stopping triggered.")
+                    # recover best weights
+                    self.load_state_dict(best_weights)
+                    return
                 
-                decisions_hat = output_hat[1][0]
-                
-                p_hat = decisions_hat[0]
-                
-                # solve RT layer, find redispatch cost
-                rt_output = self.rt_layer(p_hat, y_batch.reshape(-1,1), solver_args={'max_iters':50000})                
-
-                # CRPS of combination
-                crps_i = sum([torch.square( cdf_comb_hat[i] - 1*(self.support >= y_batch[i]) ).sum() for i in range(len(y_batch))])
-
-                # total loss
-                loss = rt_output[-1].mean() + self.gamma*crps_i
-
-                total_loss += loss.item()
-                
-        average_loss = total_loss / len(data_loader)
-        return average_loss
-    
-
 class Contextual_Scenario_Robust_OPF(nn.Module):        
     
     ''' Deterministic market clearing and feasibility under scenarios, modeling redispatch as recourse. 
@@ -1418,9 +1339,13 @@ class RT_Clearing(nn.Module):
         
 
         # RT dispatch cost (penalize violations)
-        
-        rt_output = self.rt_layer(r_up_hat_proj, r_down_hat_proj, f_margin_up_hat_proj, f_margin_down_hat_proj, 
-                                  w_error_scen, solver_args={'max_iters':100_000})                
+        try:
+            rt_output = self.rt_layer(r_up_hat_proj, r_down_hat_proj, f_margin_up_hat_proj, f_margin_down_hat_proj, 
+                                              w_error_scen, solver_args={'max_iters':50_000, "solve_method": "ECOS"})                
+        except:            
+            rt_output = self.rt_layer(r_up_hat_proj, r_down_hat_proj, f_margin_up_hat_proj, f_margin_down_hat_proj, 
+                                              w_error_scen, solver_args={'max_iters':50_000, "solve_method": "SCS"})                
+            
         cost_RT_hat = rt_output[-1]
         rt_loss = cost_RT_hat.mean()
 

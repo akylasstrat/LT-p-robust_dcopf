@@ -816,7 +816,7 @@ patience = 5
 batch_size = 500
 num_epoch = 1000
 
-Num_scen_list = [2, 3, 4]
+Num_scen_list = [2, 3, 4, 5]
 nobs_valid = 500
 train_data_loader = create_data_loader([tensor_train_demand[:-nobs_valid], tensor_train_wind[:-nobs_valid], tensor_train_wind_error[:-nobs_valid]], batch_size = batch_size)
 valid_data_loader = create_data_loader([tensor_train_demand[-nobs_valid:], tensor_train_wind[-nobs_valid:], tensor_train_wind_error[-nobs_valid:]], batch_size = batch_size)
@@ -825,7 +825,7 @@ num_uncertainties = len(grid['w_exp'])
 
 mlp_param = {}
 mlp_param['input_size'] = grid['n_loads'] + grid['n_wind']
-mlp_param['hidden_sizes'] = []
+mlp_param['hidden_sizes'] = [20, 20, 20]
 
 
 contextual_models_list = []
@@ -833,11 +833,11 @@ Predicted_scen_list = []
 for num_scen in Num_scen_list:    
     
     # initialize (not sure we need this)
-    w_init_error_scen = np.random.normal(loc = 0, scale = 0.5, size = (num_scen, num_uncertainties))
+    w_init_error_scen = np.random.normal(loc = 0, scale = 0.1, size = (num_scen, num_uncertainties))
     
     # Train model
     contextual_robust_opf_model = Contextual_Scenario_Robust_OPF(mlp_param, num_uncertainties, num_scen, grid, w_init_error_scen, c_viol = c_viol)
-    optimizer = torch.optim.Adam(contextual_robust_opf_model.parameters(), lr = 1e-1, weight_decay = 1e-5)
+    optimizer = torch.optim.Adam(contextual_robust_opf_model.parameters(), lr = 1e-1, weight_decay = 1e-4)
     contextual_robust_opf_model.train_model(train_data_loader, valid_data_loader, optimizer, epochs = num_epoch, patience = patience)
     contextual_models_list.append(contextual_robust_opf_model)
     
@@ -865,16 +865,15 @@ for num_scen in Num_scen_list:
     solution_dictionaries[f'Cost_driven_{num_scen}'] = cost_driven_sol
 
 #%%
-predicted_scenarios = contextual_robust_opf_model.predict(torch.FloatTensor(test_demand_samples), torch.FloatTensor(test_wind_samples) )
+# predicted_scenarios = contextual_robust_opf_model.predict(torch.FloatTensor(test_demand_samples), torch.FloatTensor(test_wind_samples) )
 
-feat_hat = torch.cat([torch.FloatTensor(test_demand_samples), torch.FloatTensor(test_wind_samples)], axis = 1)
-
-with torch.no_grad():
-    w_scen_hat = contextual_robust_opf_model.model(feat_hat).reshape(len(feat_hat), 4, 2)
-    #standard_output = self.model(feat_hat)
-#%%
-temp_UB = torch.FloatTensor(w_cap) -  torch.FloatTensor(test_wind_samples)
-temp_LB = -  torch.FloatTensor(test_wind_samples)
+# feat_hat = torch.cat([torch.FloatTensor(test_demand_samples), torch.FloatTensor(test_wind_samples)], axis = 1)
+# with torch.no_grad():
+#     w_scen_hat = contextual_robust_opf_model.model(feat_hat).reshape(len(feat_hat), 4, 2)
+#     #standard_output = self.model(feat_hat)
+# #%%
+# temp_UB = torch.FloatTensor(w_cap) -  torch.FloatTensor(test_wind_samples)
+# temp_LB = -  torch.FloatTensor(test_wind_samples)
 
 #%%
 
@@ -894,11 +893,13 @@ for i in range(0, N_test_samples, 100):
     box_scen = np.array(box_scen)
     
     hull = ConvexHull(box_scen)
+    
     plt.plot(box_scen[:,0], box_scen[:,1], 's', color = 'black', label = '90% Prediction Intervals')
     for j, simplex in enumerate(hull.simplices):
         plt.plot(box_scen[simplex, 0], box_scen[simplex, 1], color = 'black', linestyle = '--', lw = 2)    
     
     for k, num_scen in enumerate(Num_scen_list):
+        if num_scen == 2: continue
         
         temp_cost_driven_scen = Predicted_scen_list[k][i]
         hull = ConvexHull(temp_cost_driven_scen)

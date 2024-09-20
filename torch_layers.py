@@ -810,7 +810,6 @@ class Contextual_Scenario_Robust_OPF(nn.Module):
         p_G = cp.Variable((grid['n_unit']), nonneg = True)
         r_up_G = cp.Variable((grid['n_unit']), nonneg = True)
         r_down_G = cp.Variable((grid['n_unit']), nonneg = True)
-        slack = cp.Variable((grid['n_nodes']), nonneg = True)
         DA_cost = cp.Variable((1), nonneg = True)
         
         f_margin_up = cp.Variable((grid['n_lines']), nonneg = True)
@@ -819,6 +818,9 @@ class Contextual_Scenario_Robust_OPF(nn.Module):
         # recourse actions
         p_rt_up = cp.Variable((grid['n_unit'], num_scen), nonneg = True)
         p_rt_down = cp.Variable((grid['n_unit'], num_scen), nonneg = True)
+
+        slack_up = cp.Variable((grid['n_nodes'], num_scen), nonneg = True)
+        slack_down = cp.Variable((grid['n_nodes'], num_scen), nonneg = True)
 
         #### DA constraints
         DA_constraints = [p_G + r_up_G<= self.Pmax.reshape(-1), p_G - r_down_G >= 0, 
@@ -829,17 +831,16 @@ class Contextual_Scenario_Robust_OPF(nn.Module):
         ##### Feasibility scenarios/ robust constraints per scenario
         Robust_constr = [ p_rt_up[:,s] <= r_up_G for s in range(num_scen)] \
                         + [p_rt_down[:,s] <= r_down_G for s in range(num_scen)]\
-                        + [p_rt_up[:,s].sum() - p_rt_down[:,s].sum() + slack.sum() + w_error_scen[s].sum() == 0 for s in range(num_scen)]\
-                        + [self.PTDF@(self.node_G@(p_rt_up[:,s] - p_rt_down[:,s]) + slack + self.node_W@w_error_scen[s]) <= f_margin_up for s in range(num_scen)]\
-                        + [-self.PTDF@(self.node_G@(p_rt_up[:,s] - p_rt_down[:,s]) + slack + self.node_W@w_error_scen[s]) <= f_margin_down for s in range(num_scen)]\
+                        + [p_rt_up[:,s].sum() - p_rt_down[:,s].sum() + slack_up[:,s].sum() - slack_down[:,s].sum() + w_error_scen[s].sum() == 0 for s in range(num_scen)]\
+                        + [self.PTDF@(self.node_G@(p_rt_up[:,s] - p_rt_down[:,s]) + slack_up[:,s] - slack_down[:,s] + self.node_W@w_error_scen[s]) <= f_margin_up for s in range(num_scen)]\
+                        + [-self.PTDF@(self.node_G@(p_rt_up[:,s] - p_rt_down[:,s]) + slack_up[:,s] - slack_down[:,s] + self.node_W@w_error_scen[s]) <= f_margin_down for s in range(num_scen)]\
         
-
-        DA_constraints += [DA_cost == self.Cost@p_G + self.C_r_up@r_up_G + self.C_r_down@r_down_G + self.c_viol*slack.sum()]
+        DA_constraints += [DA_cost == self.Cost@p_G + self.C_r_up@r_up_G + self.C_r_down@r_down_G + self.c_viol*(slack_up.sum() + slack_down.sum())]
         
         objective_funct = cp.Minimize( DA_cost ) 
         robust_opf_problem = cp.Problem(objective_funct, DA_constraints + Robust_constr)         
         self.robust_opf_layer = CvxpyLayer(robust_opf_problem, parameters=[d_nominal, w_nominal, w_error_scen],
-                                           variables = [p_G, r_up_G, r_down_G, p_rt_up, p_rt_down, f_margin_up, f_margin_down, DA_cost])
+                                           variables = [p_G, r_up_G, r_down_G, p_rt_up, p_rt_down, f_margin_up, f_margin_down, slack_up, slack_down, DA_cost])
                                         
         
         ###### RT market layer/ full redispatch
@@ -853,8 +854,8 @@ class Contextual_Scenario_Robust_OPF(nn.Module):
         recourse_up = cp.Variable((grid['n_unit']), nonneg = True)
         recourse_down = cp.Variable((grid['n_unit']), nonneg = True)
         
-        slack_up = cp.Variable(grid['n_nodes'], nonneg = True)
-        slack_down = cp.Variable(grid['n_nodes'], nonneg = True)
+        rt_slack_up = cp.Variable(grid['n_nodes'], nonneg = True)
+        rt_slack_down = cp.Variable(grid['n_nodes'], nonneg = True)
                 
         cost_RT = cp.Variable(1, nonneg = True)
         
@@ -862,18 +863,18 @@ class Contextual_Scenario_Robust_OPF(nn.Module):
 
         RT_sched_constraints += [recourse_up <= r_up_param]            
         RT_sched_constraints += [recourse_down <= r_down_param]            
-        RT_sched_constraints += [self.PTDF@(self.node_G@(recourse_up - recourse_down) + (slack_up -  slack_down) + self.node_W@(w_realized_error)) <= f_margin_up_param]            
-        RT_sched_constraints += [-self.PTDF@(self.node_G@(recourse_up - recourse_down) + (slack_up -  slack_down) + self.node_W@(w_realized_error)) <= f_margin_down_param]            
+        RT_sched_constraints += [self.PTDF@(self.node_G@(recourse_up - recourse_down) + (rt_slack_up -  rt_slack_down) + self.node_W@(w_realized_error)) <= f_margin_up_param]            
+        RT_sched_constraints += [-self.PTDF@(self.node_G@(recourse_up - recourse_down) + (rt_slack_up -  rt_slack_down) + self.node_W@(w_realized_error)) <= f_margin_down_param]            
                 
         # balancing
-        RT_sched_constraints += [ recourse_up.sum() - recourse_down.sum() + w_realized_error.sum() + (slack_up -  slack_down).sum() == 0]
-        RT_sched_constraints += [cost_RT == self.c_viol*(slack_up.sum() + slack_down.sum()) ]
+        RT_sched_constraints += [ recourse_up.sum() - recourse_down.sum() + w_realized_error.sum() + (rt_slack_up -  rt_slack_down).sum() == 0]
+        RT_sched_constraints += [cost_RT == self.c_viol*(rt_slack_up.sum() + rt_slack_down.sum()) ]
             
         objective_funct = cp.Minimize( cost_RT ) 
         rt_problem = cp.Problem(objective_funct, RT_sched_constraints)
          
         self.rt_layer = CvxpyLayer(rt_problem, parameters=[r_up_param, r_down_param, f_margin_up_param, f_margin_down_param, w_realized_error],
-                                           variables = [recourse_up, recourse_down, slack_up, slack_down, cost_RT] )
+                                           variables = [recourse_up, recourse_down, rt_slack_up, rt_slack_down, cost_RT] )
 
 
     def scenario_projection(self, w_nominal, w_error_scen):
@@ -887,9 +888,9 @@ class Contextual_Scenario_Robust_OPF(nn.Module):
         w_proj = w_error_scen
         
         #print(torch.maximum(torch.minimum( w_error_scen[:,0,:], temp_UB), temp_LB).shape)
-        for j in range(self.num_constr):
-            with torch.no_grad():
-                w_proj[:,j,:] = torch.maximum(torch.minimum( w_error_scen[:,j,:], temp_UB), temp_LB)
+        with torch.no_grad():
+            for j in range(self.num_constr):
+                    w_proj[:,j,:] = torch.maximum(torch.minimum( w_error_scen[:,j,:], temp_UB), temp_LB)
         
         
         # w_proj = self.simplex_projection(self.weights.clone())
@@ -1032,32 +1033,6 @@ class Contextual_Scenario_Robust_OPF(nn.Module):
         for epoch in range(epochs):
             # activate train functionality
             self.train()
-
-            # # visualize current scenarios and the induced convex hull
-            # if ((epoch)%5 == 0): 
-
-            #     for batch in train_loader:
-            #         y_batch = batch[0]
-                    
-            #         fig, ax = plt.subplots(figsize = (6,4))                
-            #         w_scen = to_np(self.w_scenarios_param)
-            #         plt.scatter(y_batch[:,0], y_batch[:,1], label = 'Data')                    
-            #         # Cost-driven convex hull
-            #         hull = ConvexHull(w_scen)
-            #         plt.plot(w_scen[:,0], w_scen[:,1], 's', color = 'tab:red', label = 'Scenarios')
-            #         for j, simplex in enumerate(hull.simplices):
-            #             if j == 0:
-            #                 plt.plot(w_scen[simplex, 0], w_scen[simplex, 1], color = 'tab:red', linestyle = '--', lw = 2, label = 'Convex Hull')    
-            #             else:
-            #                 plt.plot(w_scen[simplex, 0], w_scen[simplex, 1], color = 'tab:red', linestyle = '--', lw = 2)    
-            #         plt.ylim([-2, 2])
-            #         plt.xlim([-2, 2])
-            #         plt.title(f'C_viol = {self.c_viol} \$/MWh', fontsize = 12)
-            #         plt.xlabel('Error 1')
-            #         plt.xlabel('Error 2')
-            #         plt.legend(fontsize = 12, loc = 'upper right')
-            #         plt.show()
-            #         break
 
             average_train_loss = self.epoch_train(train_loader, optimizer)
 

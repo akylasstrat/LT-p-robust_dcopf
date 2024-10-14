@@ -819,18 +819,18 @@ LB_init = - grid['w_exp'] + 1
 
 from torch_layers import *
 
-patience = 25
-batch_size = 2000
+patience = 15
+batch_size = 1000
 num_epoch = 1000
 
 tensor_trainY = torch.FloatTensor(train_errors)
 
-train_data_loader = create_data_loader([tensor_trainY], batch_size = batch_size)
-valid_data_loader = create_data_loader([tensor_trainY], batch_size = batch_size)
+train_data_loader = create_data_loader([tensor_trainY], batch_size = batch_size, shuffle = False)
+# valid_data_loader = create_data_loader([tensor_trainY], batch_size = batch_size)
 
 robust_opf_model = Robust_OPF(grid['n_wind'], 4, grid, UB_init, LB_init, c_viol = c_viol, add_fixed_box = False)
 optimizer = torch.optim.Adam(robust_opf_model.parameters(), lr = 1e-2)
-robust_opf_model.train_model(train_data_loader, valid_data_loader, optimizer, epochs = num_epoch, patience = patience, validation = False)
+robust_opf_model.train_model(train_data_loader, None, optimizer, epochs = num_epoch, patience = patience)
 
 #%% resolve using learned polyhedral
 

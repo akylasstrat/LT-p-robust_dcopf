@@ -229,14 +229,15 @@ class Robust_OPF(nn.Module):
             torch.Tensor: outputs of CVXPY layer, see declaration above
         """
 
-        cvxpy_output = self.robust_opf_layer(H_value, h_value, solver_args={'max_iters':100_000})
-
+        try:
+            cvxpy_output = self.robust_opf_layer(H_value, h_value, solver_args={'max_iters':20_000, "solve_method": "ECOS"})
+        except:            
+            cvxpy_output = self.robust_opf_layer(H_value, h_value, solver_args={'max_iters':20_000, "solve_method": "SCS"})
         return cvxpy_output
     
-    def train_model(self, train_loader, val_loader, optimizer, epochs = 20, patience=5, validation = False, relative_tolerance = 0):
-          
+    def epoch_train(self, loader, opt=None):
         """
-        Training: learning parameters H,h for an uncertainty set Xi = {xi | H@xi <= h} using differential optimization
+        Training: learning parameters w_scen for an uncertainty set Xi = { xi_i}, for i = 1,..., n
 
         Args:
             train_loader, val_loader: data generators
@@ -248,198 +249,125 @@ class Robust_OPF(nn.Module):
             
         Returns:
             torch.Tensor: outputs of CVXPY layer, see declaration above
-        """
+        """                
+
+        total_loss = 0.
         
-        #L_t = []
-        best_train_loss = 1e7
-        best_val_loss = 1e7 
+        for i, batch_data in enumerate(loader):
+            # sample batch data: wind error realizations
+            y_batch = batch_data[0]
+
+            # Forward pass: Robust OPF
+            decisions_hat = self.forward(self.H, self.h)
+            
+            p_hat = decisions_hat[0]
+            r_up_hat = decisions_hat[1]
+            r_down_hat = decisions_hat[2]
+            W_hat = decisions_hat[3] # Linear decision rules --- recourse policy
+            f_margin_up_hat = decisions_hat[4]
+            f_margin_down_hat = decisions_hat[5]
+            
+            # Evaluate cost-driven error
+            # DA cost                
+            cost_DA_hat = self.Cost@p_hat + self.C_r_up@r_up_hat + self.C_r_down@r_down_hat
+
+            # RT dispatch cost (penalize violations)
+            recourse_actions = -(W_hat@y_batch.T).T
+            
+            ### Estimate RT redispatch cost: penalize infeasibilities (see Mieth, Poor 2023 )
+            # Projection step to avoid infeasibilities due to numerical issues
+            aggr_rup_violations = torch.maximum(recourse_actions - r_up_hat, torch.zeros(self.grid['n_unit'])).sum()
+            aggr_rdown_violations = torch.maximum(-recourse_actions - r_down_hat, torch.zeros(self.grid['n_unit'])).sum()
+                                                                                                                                  
+            # exceeding line rating
+            rt_injections = (self.PTDF@(self.node_G@recourse_actions.T + self.node_W@y_batch.T)).T
+            
+            aggr_f_margin_up_violations = torch.maximum( rt_injections - f_margin_up_hat, torch.zeros(self.grid['n_lines']) ).sum()
+            aggr_f_margin_down_violations = torch.maximum( -rt_injections - f_margin_down_hat, torch.zeros(self.grid['n_lines'])).sum()
+
+            rt_cost = self.c_viol*(aggr_rup_violations + aggr_rdown_violations + aggr_f_margin_up_violations + aggr_f_margin_down_violations)                
+            
+            # loss: aggregate DA and RT cost
+            loss = cost_DA_hat.mean() + rt_cost                
+                
+            if opt:
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+            
+            total_loss += loss.item() * len(y_batch)
+            
+        return total_loss / len(loader.dataset)
+
+    
+    def train_model(self, train_loader, val_loader, optimizer, epochs = 20, patience=5, verbose = 0, plot = True, validation = False):
+        
+        if val_loader == None:
+            validation = False
+            
+        best_train_loss = float('inf')
+        best_val_loss = float('inf')
         early_stopping_counter = 0
         best_weights = copy.deepcopy(self.state_dict())
 
         Pmax_tensor = torch.FloatTensor(self.grid['Pmax'].reshape(-1))
         Pmin_tensor = torch.FloatTensor(self.grid['Pmin'].reshape(-1))
         
-        # estimate initial loss
-        print('Estimate Initial Loss...')
-        '''
-        initial_train_loss = 0
-        with torch.no_grad():
-            for batch_data in train_loader:
-                y_batch = batch_data[-1]
-                # clear gradients
-                optimizer.zero_grad()
-                output_hat = self.forward(batch_data[:-1])
-                
-                pdf_comb_hat = output_hat[0]
-                cdf_comb_hat = pdf_comb_hat.cumsum(1)
-                
-                decisions_hat = output_hat[1][0]                
-                p_hat = decisions_hat[0]
-                
-                # Project p_hat to feasible set
-                p_hat_proj = torch.maximum(torch.minimum(p_hat, Pmax_tensor), Pmin_tensor)
-                cost_DA_hat = decisions_hat[-1]
-
-                # solve RT layer, find redispatch cost                
-                rt_output = self.rt_layer(p_hat_proj, y_batch.reshape(-1,1), solver_args={'max_iters':50_000})                
-                # CRPS of combination
-                crps_i = sum([torch.square( cdf_comb_hat[i] - 1*(self.support >= y_batch[i]) ).sum() for i in range(len(y_batch))])
-                loss = cost_DA_hat.mean() + rt_output[-1].mean() + self.gamma*crps_i
- 
-                initial_train_loss += loss.item()
-                
-        initial_train_loss = initial_train_loss/len(train_loader)
-        best_train_loss = initial_train_loss
-        print(f'Initial Estimate: {best_train_loss}')
-        '''
         for epoch in range(epochs):
             # activate train functionality
             self.train()
-            running_loss = 0.0                
-            
 
-            # sample batch data
-            for batch_data in train_loader:
-
-                # sample batch data: wind error realizations
-                y_batch = batch_data[0]
-                
-                # clear gradients
-                optimizer.zero_grad()
-
-                # Forward pass: solve robust OPF
-                decisions_hat = self.forward(self.H, self.h)
-                
-                p_hat = decisions_hat[0]
-                r_up_hat = decisions_hat[1]
-                r_down_hat = decisions_hat[2]
-                W_hat = decisions_hat[3]
-                f_margin_up_hat = decisions_hat[4]
-                f_margin_down_hat = decisions_hat[5]
-                
-                # Evaluate cost-driven error
-                # DA cost                
-                cost_DA_hat = self.Cost@p_hat + self.C_r_up@r_up_hat + self.C_r_down@r_down_hat
-
-                # RT dispatch cost (penalize violations)
-                recourse_actions = -(W_hat@y_batch.T).T
-                
-                ### Estimate RT redispatch cost: penalize infeasibilities (see Mieth, Poor 2023 )
-                # Projection step to avoid infeasibilities due to numerical issues
-                aggr_rup_violations = torch.maximum(recourse_actions - r_up_hat, torch.zeros(self.grid['n_unit'])).sum()
-                aggr_rdown_violations = torch.maximum(-recourse_actions - r_down_hat, torch.zeros(self.grid['n_unit'])).sum()
-                                                                                                                                      
-                # exceeding line rating
-                rt_injections = (self.PTDF@(self.node_G@recourse_actions.T + self.node_W@y_batch.T)).T
-                
-                aggr_f_margin_up_violations = torch.maximum( rt_injections - f_margin_up_hat, torch.zeros(self.grid['n_lines']) ).sum()
-                aggr_f_margin_down_violations = torch.maximum( -rt_injections - f_margin_down_hat, torch.zeros(self.grid['n_lines'])).sum()
-
-                rt_cost = self.c_viol*(aggr_rup_violations + aggr_rdown_violations + aggr_f_margin_up_violations + aggr_f_margin_down_violations)                
-                
-                # loss: aggregate DA and RT cost
-                loss = cost_DA_hat.mean() + rt_cost                
-                    
-                # backward pass
-                # forward pass: combine forecasts and each stochastic ED problem
-                loss.backward()
-                optimizer.step()
-                
-                running_loss += loss.item()
-                
-            if epoch%10 == 0:
-                # visualizations for sanity chekc
-                fig, ax = plt.subplots(figsize = (6,4))
-                x = np.linspace(-2, 2, 1000)
-                
-                H_np = to_np(self.H)
-                h_np = to_np(self.h)
-                
-                y = [(h_np[i] - H_np[i,0]*x)/H_np[i,1] for i in range(len(H_np))]
-                
-
-                plt.scatter(y_batch[:,0], y_batch[:,1], label = '_nolegend_')
-                for i in range(len(H_np)):
-                    plt.plot(x, y[i], color = 'tab:green')
-                plt.ylim([-2, 2])
-                plt.xlim([-2, 2])
-                plt.title(f'C_viol = {self.c_viol} \$/MWh, Iteration: {epoch}', fontsize = 12)
-                plt.xlabel('Error 1')
-                plt.xlabel('Error 2')
-                plt.legend([f'Ineq. {i}' for i in range(self.num_constr)], fontsize = 12, ncol = 2)
-                plt.show()
-                
-            average_train_loss = running_loss / len(train_loader)
-                                        
-            if validation == True:
-                # evaluate performance on stand-out validation set
-                val_loss = self.evaluate(val_loader)
-                print(f"Epoch [{epoch + 1}/{epochs}] - Train Loss: {average_train_loss:.4f} - Val Loss: {val_loss:.4f}")
-                
-                if (val_loss < best_val_loss) and ( (best_val_loss-val_loss)/best_val_loss > relative_tolerance):
-                    best_val_loss = val_loss
-                    best_weights = copy.deepcopy(self.state_dict())
-                    early_stopping_counter = 0
-                else:
-                    early_stopping_counter += 1
-                    if early_stopping_counter >= patience:
-                        print("Early stopping triggered.")
-                        # recover best weights
-                        self.load_state_dict(best_weights)
-                        return
+            average_train_loss = self.epoch_train(train_loader, optimizer)
+            if validation:
+                val_loss = self.epoch_train(val_loader)
             else:
-                # only evaluate on training data set
-                print(f"Epoch [{epoch + 1}/{epochs}] - Train Loss: {average_train_loss:.4f} ")
-    
-                if (average_train_loss < best_train_loss) and ( (best_train_loss-average_train_loss)/best_train_loss > relative_tolerance):
-                    best_train_loss = average_train_loss
-                    best_weights = copy.deepcopy(self.state_dict())
-                    early_stopping_counter = 0
+                val_loss = average_train_loss
+
+            # visualize current scenarios and the induced convex hull
+            if (epoch%10 == 0) and (plot == True): 
+                for batch in train_loader:
+                    y_batch = batch[0]                    
+
+                    # visualizations for sanity chekc
+                    fig, ax = plt.subplots(figsize = (6,4))
+                    x = np.linspace(-2, 2, 1000)
                     
-                else:
-                    early_stopping_counter += 1
-                    if early_stopping_counter >= patience:
-                        print("Early stopping triggered.")
-                        # recover best weights
-                        self.load_state_dict(best_weights)
-                        return
-        
+                    H_np = to_np(self.H)
+                    h_np = to_np(self.h)
+                    
+                    y = [(h_np[i] - H_np[i,0]*x)/H_np[i,1] for i in range(len(H_np))]
+                    
+    
+                    plt.scatter(y_batch[:,0], y_batch[:,1], label = '_nolegend_')
+                    for i in range(len(H_np)):
+                        plt.plot(x, y[i], color = 'tab:green')
+                    plt.ylim([-2, 2])
+                    plt.xlim([-2, 2])
+                    plt.title(f'C_viol = {self.c_viol} \$/MWh, Iteration: {epoch}', fontsize = 12)
+                    plt.xlabel('Error 1')
+                    plt.xlabel('Error 2')
+                    plt.legend([f'Ineq. {i}' for i in range(self.num_constr)], fontsize = 12, ncol = 2)
+                    plt.show()
+                    break
+            
+            if verbose != -1:
+                print(f"Epoch [{epoch + 1}/{epochs}] - Train Loss: {average_train_loss:.4f} - Val Loss: {val_loss:.4f}")
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_weights = copy.deepcopy(self.state_dict())
+                early_stopping_counter = 0
+            else:
+                early_stopping_counter += 1
+                if early_stopping_counter >= patience:
+                    print("Early stopping triggered.")
+                    # recover best weights
+                    self.load_state_dict(best_weights)
+                    return
         print('Reached epoch limit.')
         self.load_state_dict(best_weights)
         return
-
-    def evaluate(self, data_loader):
-        # evaluate loss criterion/ used for estimating validation loss
-        self.eval()
-        total_loss = 0.0
-        with torch.no_grad():
-            for batch_data in data_loader:
-                y_batch = batch_data[-1]
-
-                # forward pass: combine forecasts and each stochastic ED problem
-                output_hat = self.forward(batch_data[:-1])
-
-                pdf_comb_hat = output_hat[0]
-                cdf_comb_hat = pdf_comb_hat.cumsum(1)
                 
-                decisions_hat = output_hat[1][0]
-                
-                p_hat = decisions_hat[0]
-                
-                # solve RT layer, find redispatch cost
-                rt_output = self.rt_layer(p_hat, y_batch.reshape(-1,1), solver_args={'max_iters':50000})                
-
-                # CRPS of combination
-                crps_i = sum([torch.square( cdf_comb_hat[i] - 1*(self.support >= y_batch[i]) ).sum() for i in range(len(y_batch))])
-
-                # total loss
-                loss = rt_output[-1].mean() + self.gamma*crps_i
-
-                total_loss += loss.item()
-                
-        average_loss = total_loss / len(data_loader)
-        return average_loss
-    
 class Scenario_Robust_OPF(nn.Module):        
     ''' Deterministic market clearing and feasibility under scenarios, modeling redispatch as recourse. 
         This is equivalent to a robust problem parameterized by a discrete scenario uncertainty set.
@@ -666,8 +594,9 @@ class Scenario_Robust_OPF(nn.Module):
             
         return total_loss / len(loader.dataset)
         
-    def train_model(self, train_loader, val_loader, optimizer, epochs = 20, patience=5, verbose = 0, validation = False):
+    def train_model(self, train_loader, val_loader, optimizer, epochs = 20, patience=5, verbose = 0, validation = True):
         
+        if val_loader == None: validation = False
         # best_train_loss = float('inf')
         best_val_loss = float('inf')
         early_stopping_counter = 0
